@@ -63,7 +63,9 @@ constexpr uint32_t kLmBakeCacheMagic    = 0x424D4C44; // "DLMB" little-endian
 // v6: throw-derived intensity (throwAlpha) in the key.
 // v7: S3 door shadows (doorShadows flag) in the key — door-adjacent
 //     lights move from base to overlays, so the decomposition differs.
-constexpr uint32_t kLmBakeCacheVersion  = 7;
+// v8: per-rec door-static direction snapshot (the runtime direction
+//     recombine's base term).
+constexpr uint32_t kLmBakeCacheVersion  = 8;
 // Bump when the bake FORMULA changes meaning — i.e. when identical parameters
 // would now produce different lumels. Parameter changes do not need a bump;
 // they are part of the key.
@@ -77,7 +79,13 @@ constexpr uint32_t kLmBakeCacheVersion  = 7;
 //       ambient fed the lobe).
 //   v5: direction is door-occluded at load and re-encoded at runtime by
 //       door events; v4 caches carry the leaky field and must die.
-constexpr uint32_t kLmBakeFormulaVersion = 5;
+//   v6: direction weights move to stored-energy space (the recombine's
+//       convention) — the field softens slightly around very bright
+//       lights and the runtime identity becomes exact.
+//   v7: door-adjacent lights contribute NO direction at load — the
+//       runtime recombine (init + door events) is the sole author of
+//       their direction term, killing the double count.
+constexpr uint32_t kLmBakeFormulaVersion = 7;
 
 struct LmBakeCacheKey {
     uint64_t missionHash = 0;
@@ -193,6 +201,13 @@ inline bool writeLightmapBakeCache(const std::string &cachePath,
         blob.insert(blob.end(), rec.baseCrop.begin(), rec.baseCrop.end());
         for (const auto &ov : rec.overlays)
             blob.insert(blob.end(), ov.begin(), ov.end());
+        // v8: door-static direction snapshot (empty on non-door polys).
+        detail::put(blob, static_cast<uint8_t>(rec.dirBase.empty() ? 0 : 1));
+        if (!rec.dirBase.empty()) {
+            detail::put(blob, rec.dirBaseMagScale);
+            detail::put(blob, rec.dirBaseWeightScale);
+            blob.insert(blob.end(), rec.dirBase.begin(), rec.dirBase.end());
+        }
     }
     // v3: dominant-direction atlas (same dimensions as the base atlas).
     detail::put(blob, static_cast<uint8_t>(
@@ -343,6 +358,19 @@ inline bool readLightmapBakeCache(const std::string &cachePath,
             if (!detail::getBytes(blob, boff, rec.overlays[k], crop)) {
                 whyMiss = "overlay payload truncated"; return false;
             }
+        // v8: door-static direction snapshot.
+        uint8_t hasDirBase = 0;
+        if (!get(blob, boff, hasDirBase)) {
+            whyMiss = "dirBase flag truncated"; return false;
+        }
+        if (hasDirBase) {
+            if (!get(blob, boff, rec.dirBaseMagScale) ||
+                !get(blob, boff, rec.dirBaseWeightScale) ||
+                !detail::getBytes(blob, boff, rec.dirBase,
+                                  static_cast<size_t>(w) * h * 4)) {
+                whyMiss = "dirBase payload truncated"; return false;
+            }
+        }
         animPolys.push_back(std::move(rec));
     }
     // v3: optional dominant-direction atlas.

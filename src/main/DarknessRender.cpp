@@ -7917,6 +7917,20 @@ int main(int argc, char *argv[]) {
         for (const auto &d : gpu.doorShadowDoors)
             gpu.shadowCache.dynCasterBodies.push_back(d.bodyIdx);
 
+        // The init recombine painted door-light directions into the CPU
+        // dir atlas — push the whole texture once (per-rect tracking
+        // starts after).
+        if (doorShadow.dirInitPainted() &&
+            bgfx::isValid(gpu.rebakedDirHandle) &&
+            !gpu.rebakedDirAtlas.rgba.empty()) {
+            const bgfx::Memory *dmem = bgfx::copy(
+                gpu.rebakedDirAtlas.rgba.data(),
+                static_cast<uint32_t>(gpu.rebakedDirAtlas.rgba.size()));
+            bgfx::updateTexture2D(gpu.rebakedDirHandle, 0, 0, 0, 0,
+                static_cast<uint16_t>(gpu.rebakedDirAtlas.size),
+                static_cast<uint16_t>(gpu.rebakedDirAtlas.size), dmem);
+        }
+
         // S2 acceptance: GPU lumel bake vs the CPU bake, same rect.
         if (cfg.lumelBakeTest) {
             Darkness::BakeFormula testF = gpu.rebakedFormula;

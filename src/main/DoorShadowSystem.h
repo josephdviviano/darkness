@@ -212,29 +212,6 @@ public:
                 for (int16_t li : (*mAnimPolys)[r].overlayLightIdx)
                     if (li > 0) mLightRecs[li].push_back(r);
         }
-        // Per-rec peaks (max byte of base / each overlay) — the DIRECTION
-        // re-bake gate: re-encoding a poly's direction costs an
-        // all-candidates pass (measured 12x the energy pass: 17.4M rays /
-        // 9.1 s per one-door event ungated), and it only MATTERS where
-        // this light meaningfully shapes the field.
-        mRecBasePeak.clear();
-        mRecOverlayPeak.clear();
-        if (mAnimPolys) {
-            mRecBasePeak.resize(mAnimPolys->size(), 0);
-            mRecOverlayPeak.resize(mAnimPolys->size());
-            for (size_t r = 0; r < mAnimPolys->size(); ++r) {
-                const RebakedAnimPoly &rec = (*mAnimPolys)[r];
-                uint8_t bp = 0;
-                for (uint8_t b : rec.baseCrop) bp = std::max(bp, b);
-                mRecBasePeak[r] = bp;
-                auto &ops = mRecOverlayPeak[r];
-                ops.resize(rec.overlays.size(), 0);
-                for (size_t k = 0; k < rec.overlays.size(); ++k)
-                    for (uint8_t b : rec.overlays[k])
-                        ops[k] = std::max(ops[k], b);
-            }
-        }
-
         // Per-rec poly bounding spheres for the shadow-cone work-list
         // filter: an event re-bakes a (rec, light) pair only if the
         // segment poly->light crosses THE dirty door's swept sphere.
@@ -316,6 +293,43 @@ public:
             "Door shadows: %zu door-adjacent overlay buffer(s), %.1f MB "
             "(the base a K-pose pre-bake multiplies)\n",
             doorOverlayCount, doorOverlayBytes / 1048576.0);
+        // ── Init-time direction recombine ──
+        // Door-adjacent lights contribute no direction at LOAD (or the
+        // runtime recombine would double-count them) — paint their term
+        // in now through the SAME code path door events use: one path,
+        // consistency by construction. The idempotency tripwire re-runs
+        // a sample and demands bit-identical texels (the recombine is
+        // deterministic; any diff means a real bug).
+        if (mDirAtlas && !mDirAtlas->rgba.empty() && mAnimPolys) {
+            const auto t0 = std::chrono::steady_clock::now();
+            size_t painted = 0;
+            for (size_t r = 0; r < mAnimPolys->size(); ++r)
+                if (!(*mAnimPolys)[r].dirBase.empty()) {
+                    recombineDirection(r);
+                    ++painted;
+                }
+            const std::vector<uint8_t> snap = mDirAtlas->rgba;
+            size_t retested = 0;
+            for (size_t r = 0;
+                 r < mAnimPolys->size() && retested < 100; ++r)
+                if (!(*mAnimPolys)[r].dirBase.empty()) {
+                    recombineDirection(r);
+                    ++retested;
+                }
+            const bool idempotent = (snap == mDirAtlas->rgba);
+            std::fprintf(stderr,
+                "[DIR_RECOMBINE] init: %zu door polys painted in %.0f ms; "
+                "idempotency over %zu re-runs: %s\n",
+                painted,
+                std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - t0).count(),
+                retested, idempotent ? "PASS" : "FAIL");
+            // The renderer uploads the whole dir texture once after init;
+            // per-rect dirty tracking starts clean.
+            mDirDirty.clear();
+            mDirInitPainted = true;
+        }
+
         std::fprintf(stderr,
             "Door shadows: %zu door(s), %d door-adjacent light(s), "
             "%zu light->poly overlay lists\n",
@@ -415,12 +429,12 @@ public:
                     }
                 }
                 mReadyRecs.push_back(it.recIdx);
-                // Direction stays a (gated) CPU pass until the second
-                // render target lands — run it as results arrive.
-                if (kEventDirRebake &&
-                    dirSignificant(it.recIdx, it.lightIdx) &&
-                    mEventDirDone.insert(it.recIdx).second)
-                    rebakeDirection(it.recIdx);
+                // Direction: queue the ray-free RECOMBINE (slice 3) —
+                // budgeted per frame below, ungated (every door poly's
+                // direction tracks door state; the dim-but-directional
+                // polys are exactly where specular-through-doors lives).
+                if (mEventDirDone.insert(it.recIdx).second)
+                    mDirQueue.push_back(it.recIdx);
             }
             mEventGpuRects += gpu->batch.items.size();
             gpu->batch.items.clear();
@@ -521,10 +535,8 @@ public:
                         // CPU fallback for this item.
                         ++mWorkCursor;
                         rebakeOverlay(recIdx, lightIdx);
-                        if (kEventDirRebake &&
-                            dirSignificant(recIdx, lightIdx) &&
-                            mEventDirDone.insert(recIdx).second)
-                            rebakeDirection(recIdx);
+                        if (mEventDirDone.insert(recIdx).second)
+                            mDirQueue.push_back(recIdx);
                         ++mEventCpuRects;
                         continue;
                     }
@@ -578,19 +590,30 @@ public:
             while (budget-- > 0 && mWorkCursor < mWork.size()) {
                 const auto &[recIdx, lightIdx] = mWork[mWorkCursor++];
                 rebakeOverlay(recIdx, lightIdx);
-                if (kEventDirRebake &&
-                    dirSignificant(recIdx, lightIdx) &&
-                    mEventDirDone.insert(recIdx).second)
-                    rebakeDirection(recIdx);
+                if (mEventDirDone.insert(recIdx).second)
+                    mDirQueue.push_back(recIdx);
                 if (std::chrono::duration<double, std::milli>(
                         std::chrono::steady_clock::now() - t0).count() >
                     kFrameMsBudget)
                     break;
             }
         }
+        // ── Direction recombine queue (budgeted; pure math, no rays) ──
+        {
+            const auto d0 = std::chrono::steady_clock::now();
+            while (!mDirQueue.empty()) {
+                recombineDirection(mDirQueue.back());
+                mDirQueue.pop_back();
+                if (std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() - d0).count() >
+                    kDirMsBudget)
+                    break;
+            }
+        }
+
         const bool drained =
             mWorkCursor >= mWork.size() &&
-            !(gpuMode && gpu->batch.inFlight);
+            !(gpuMode && gpu->batch.inFlight) && mDirQueue.empty();
         if (mWork.size() && drained) {
             mEventMs += std::chrono::duration<double, std::milli>(
                 std::chrono::steady_clock::now() - t0).count();
@@ -646,90 +669,79 @@ private:
         mEventRays += stats.rays;
     }
 
-    // Does this light shape the poly's field enough for its door state to
-    // matter to the DIRECTION texels? Peaks precomputed at init.
-    bool dirSignificant(size_t recIdx, int16_t lightIdx) const {
-        if (recIdx >= mRecOverlayPeak.size() || !mAnimPolys) return false;
-        const RebakedAnimPoly &rec = (*mAnimPolys)[recIdx];
-        for (size_t k = 0; k < rec.overlayLightIdx.size(); ++k) {
-            if (rec.overlayLightIdx[k] != lightIdx) continue;
-            const uint8_t op = k < mRecOverlayPeak[recIdx].size()
-                                   ? mRecOverlayPeak[recIdx][k] : 0;
-            // Visible (>= ~6% full) AND at least half the base's peak.
-            return op >= 16 && op * 2 >= mRecBasePeak[recIdx];
-        }
-        return false;
-    }
-
-    // Re-encode one poly's DIRECTION texels at current door poses: a
-    // dir-only bake over ALL of the poly's candidate lights (the dir
-    // texel is a weighted average across every contributor, so a
-    // single-light pass cannot update it). Mirrors the load composition:
-    // sun included, ambient excluded (directionless), door hook applies
-    // to door-adjacent lights via the formula's extraOverlayLights gate.
-    // Openness alpha is PRESERVED (the gather's, not re-derivable here).
-    void rebakeDirection(size_t recIdx) {
+    // S2 slice 3 — the ray-free direction RECOMBINE. The dir texel is
+    //   encode( dirBase(texel) + Σ_doorlights lum(overlay_k, texel) ·
+    //           unitDir(light, texel) )
+    // dirBase is the load-time snapshot of everything door-static;
+    // lum(overlay) is the energy we already re-bake (its visibility IS
+    // the door state); unitDir comes from the affine lumel grid. Weight
+    // approximation, documented: the load accumulator weighs by LINEAR
+    // pre-storage peaks while stored overlays are post-transform
+    // (~0.965x linear − toe) — the [DIR_RECOMBINE] identity check at
+    // init measures the resulting error. Openness alpha preserved.
+    void recombineDirection(size_t recIdx) {
         if (!mDirAtlas || !mAtlasSet || !mAnimPolys ||
             recIdx >= mAnimPolys->size())
             return;
         const RebakedAnimPoly &rec = (*mAnimPolys)[recIdx];
+        if (rec.dirBase.size() <
+            static_cast<size_t>(rec.w) * rec.h * 4)
+            return;                          // not a door-cone poly
         if (rec.ci >= mAtlasSet->entries.size()) return;
         const auto &cellEntries = mAtlasSet->entries[rec.ci];
         if (rec.pi < 0 ||
             rec.pi >= static_cast<int>(cellEntries.size()))
             return;
         const LmapEntry &entry = cellEntries[rec.pi];
+        const LumelGrid grid =
+            buildLumelGrid(*mWr, rec.ci, rec.pi, mDensity);
+        if (!grid.valid || grid.lx != rec.w || grid.ly != rec.h) return;
 
-        // Candidate lights by reach vs the poly's bounding sphere; sun
-        // joins if the cell's own authored list carries slot 0 (the same
-        // rule the load bake applies).
-        std::vector<uint16_t> cand;
-        cand.push_back(0);
-        const glm::vec4 &ps =
-            recIdx < mRecSphere.size() ? mRecSphere[recIdx]
-                                       : glm::vec4(0.0f);
-        const Vector3 pc(ps.x, ps.y, ps.z);
-        {
-            const auto &own = mWr->cells[rec.ci].lightIndices;
-            const int cnt = own.empty() ? 0 : static_cast<int>(own[0]);
-            for (int k = 1; k <= cnt && k < static_cast<int>(own.size());
-                 ++k)
-                if (own[k] == 0) { cand.push_back(0); break; }
+        // Door overlays on this rec (light index + buffer).
+        struct DoorOv { const std::vector<uint8_t> *buf; Vector3 loc; };
+        std::vector<DoorOv> doorOvs;
+        for (size_t k = 0; k < rec.overlayLightIdx.size(); ++k) {
+            const int16_t li = rec.overlayLightIdx[k];
+            if (li > 0 && static_cast<size_t>(li) < mExtraLights.size() &&
+                mExtraLights[li] && k < rec.overlays.size())
+                doorOvs.push_back(
+                    {&rec.overlays[k],
+                     mWr->staticLights[static_cast<size_t>(li)].loc});
         }
-        for (size_t li = 1; li < mReach.size(); ++li)
-            if (mReach[li] > 0.0f &&
-                glm::length(mWr->staticLights[li].loc - pc) <=
-                    mReach[li] + ps.w)
-                cand.push_back(static_cast<uint16_t>(li));
-        cand[0] = static_cast<uint16_t>(cand.size() - 1);
+        if (doorOvs.empty()) return;
 
-        BakeFormula dirF = mFormula;
-        dirF.includeSun = true;     // the load dir field includes it
-        BakeStats stats;
-        std::vector<Vector3> lumels;
         std::vector<DirAccum> polyDir(
             static_cast<size_t>(rec.w) * rec.h, DirAccum{});
-        if (bakePolygon(*mWr, *mRp, rec.ci, rec.pi, dirF, mLightCells,
-                        lumels, stats, nullptr, nullptr, &polyDir,
-                        &cand) &&
-            static_cast<int>(lumels.size()) == rec.w * rec.h) {
-            writeDirTexelsToAtlas(polyDir, entry, *mDirAtlas, mDensity,
-                                  /*preserveAlpha=*/true);
-            mDirDirty.push_back(recIdx);
+        for (int j = 0; j < rec.h; ++j) {
+            for (int i = 0; i < rec.w; ++i) {
+                const size_t t = static_cast<size_t>(j) * rec.w + i;
+                const uint8_t *d4 = &rec.dirBase[t * 4];
+                DirAccum &da = polyDir[t];
+                const float mag =
+                    d4[2] / 255.0f * rec.dirBaseMagScale;
+                if (mag > 0.0f)
+                    da.sum = octahedralDecode(d4[0] / 255.0f,
+                                              d4[1] / 255.0f) * mag;
+                da.weight = d4[3] / 255.0f * rec.dirBaseWeightScale;
+                const Vector3 wp = grid.at(i, j);
+                for (const DoorOv &ov : doorOvs) {
+                    const uint8_t *px = &(*ov.buf)[t * 3];
+                    const float lum =
+                        std::max({px[0], px[1], px[2]}) / 255.0f;
+                    if (lum <= 0.0f) continue;
+                    const Vector3 toL = ov.loc - wp;
+                    const float len = glm::length(toL);
+                    if (len < 1e-6f) continue;
+                    da.sum += (toL / len) * lum;
+                    da.weight += lum;
+                }
+            }
         }
-        mEventRays += stats.rays;
+        writeDirTexelsToAtlas(polyDir, entry, *mDirAtlas, mDensity,
+                              /*preserveAlpha=*/true);
+        mDirDirty.push_back(recIdx);
     }
 
-    // The CPU direction re-encode is PARKED (2026-08-07): on GPU-batch
-    // collect frames it burst up to 256 all-candidate ray passes into one
-    // frame (the "door opening is incredibly slow" hitch), and its
-    // dominance gate cuts exactly the dim-but-directional polys where
-    // specular-through-doors lives — so it cost frames without delivering
-    // the feature. Direction tracking door state ships as the S2 slice-3
-    // GPU render target instead; until then the KNOWN GAP is that
-    // specular does not follow door state. rebakeDirection stays as the
-    // slice-3 CPU reference.
-    static constexpr bool kEventDirRebake = false;
     static constexpr float kRebuildSec = 0.15f;
     static constexpr int kPolysPerFrame = 48;
     static constexpr double kFrameMsBudget = 4.0;
@@ -739,6 +751,7 @@ private:
     static constexpr float kInvalidateMargin = 24.0f;
     static constexpr float kInvalidateSec = 0.75f;
     static constexpr size_t kGpuRectsPerBatch = 256;
+    static constexpr double kDirMsBudget = 2.0;
 
     const WRParsedData *mWr = nullptr;
     const RenderParams *mRp = nullptr;
@@ -756,9 +769,12 @@ private:
     int mDensity = 1;
     std::vector<float> mReach;
     std::vector<size_t> mDirDirty;
+    std::vector<size_t> mDirQueue;
+    bool mDirInitPainted = false;
+public:
+    bool dirInitPainted() const { return mDirInitPainted; }
+private:
     std::unordered_set<size_t> mEventDirDone;
-    std::vector<uint8_t> mRecBasePeak;
-    std::vector<std::vector<uint8_t>> mRecOverlayPeak;
     size_t mEventGpuRects = 0;
     size_t mEventCpuRects = 0;
 

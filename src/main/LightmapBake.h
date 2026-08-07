@@ -349,6 +349,13 @@ struct BakeFormula {
     // doorShadows flag, not by content (deterministic from mission +
     // reach).
     const std::vector<uint8_t> *extraOverlayLights = nullptr;
+    // Direction-accumulation weights in STORED-energy space (the
+    // Continuous transform's output for the peak channel) instead of
+    // linear pre-storage peaks. The runtime direction RECOMBINE weighs
+    // door lights by their stored overlay luminance — the load bake must
+    // use the same convention or the recombined field diverges wherever
+    // linear peaks exceed the storage clamp (measured: mean 110/255).
+    bool dirWeightStored = false;
     // Door swept spheres (xyz = center, w = radius) for the shadow-cone
     // gate above. NON-OWNING.
     const std::vector<glm::vec4> *doorSpheres = nullptr;
@@ -1476,8 +1483,25 @@ inline bool bakePolygon(const WRParsedData &wr,
                 acc.add(sample, visFrac, f);
 
                 if (dirAccum) {
-                    const float w =
+                    float w =
                         sample.preSpotPeak * sample.spotFactor * visFrac;
+                    if (f.dirWeightStored && w > 0.0f) {
+                        // Peak channel through the Continuous transform —
+                        // the same number a stored overlay's luminance
+                        // reads back (m = 255 for the peak channel).
+                        float lux =
+                            sample.preSpotPeak * visFrac * 255.0f - 0.5f;
+                        if (lux <= 0.0f) {
+                            w = 0.0f;
+                        } else {
+                            lux *= sample.spotFactor;
+                            if (lux > 255.0f) lux = 255.0f;
+                            const float gg = lux * 31.0f * 255.0f / 65536.0f;
+                            const float toe = (gg < 1.0f) ? (0.5f * gg * gg)
+                                                          : (gg - 0.5f);
+                            w = 8.0f * toe / 255.0f;
+                        }
+                    }
                     if (w > 0.0f) {
                         const Vector3 toL = L.loc - p;
                         const float len = glm::length(toL);
@@ -1792,6 +1816,16 @@ struct RebakedAnimPoly {
     // The static-table light behind each overlay (animMap[bit]) — which is
     // also the number runtime intensities are keyed by. -1 = unmapped.
     std::vector<int16_t> overlayLightIdx;
+    // S2 slice 3: the BASE direction accumulation (everything door-STATIC:
+    // base lights + animated overlays + sun), snapshotted at load before
+    // the door lights' direction joined. 4 B/texel: octaU, octaV, |sum|
+    // and weight quantized against the per-rec scales below. Present only
+    // on door-cone polys. The runtime direction update is then a pure
+    // RECOMBINE — base + Σ door overlays' luminance × unit-to-light — no
+    // rays, no GPU pass, no gate.
+    std::vector<uint8_t> dirBase;
+    float dirBaseMagScale = 0.0f;
+    float dirBaseWeightScale = 0.0f;
 };
 
 // Re-blend one polygon of OUR bake into the re-baked atlas:
@@ -1976,6 +2010,7 @@ inline void bakeAtlasWithOverlays(const WRParsedData &wr,
     BakeFormula overlayF = f;
     overlayF.includeAmbient = false;
     overlayF.includeSun     = false;
+    overlayF.dirWeightStored = true;
 
     const bool gather = (bounceSamples > 0 || aoStrength > 0.0f);
     // Phase A bakes WITHOUT ambient when gathering: ambient is composed at
@@ -1983,6 +2018,7 @@ inline void bakeAtlasWithOverlays(const WRParsedData &wr,
     // (ambient bouncing off every surface would double-count as fake GI).
     BakeFormula baseF = f;
     if (gather) baseF.includeAmbient = false;
+    baseF.dirWeightStored = true;
 
     const std::vector<float> *anchorTable =
         throwMode ? (f.perLightAnchor ? f.perLightAnchor : &throwAnchors)
@@ -2237,11 +2273,23 @@ inline void bakeAtlasWithOverlays(const WRParsedData &wr,
                             overlayMask[lightIdx] = 1;
                             // Overlays join the DIRECTION field too — a
                             // torch's direction is real even though its
-                            // energy animates.
+                            // energy animates. EXCEPT door-adjacent
+                            // lights: their direction lives exclusively
+                            // in the runtime RECOMBINE (dirBase snapshot
+                            // + stored-overlay weights), or it would be
+                            // double-counted there. The init-time
+                            // recombine paints them back before first
+                            // frame.
+                            const bool dirHere =
+                                !(f.extraOverlayLights &&
+                                  static_cast<size_t>(lightIdx) <
+                                      f.extraOverlayLights->size() &&
+                                  (*f.extraOverlayLights)[lightIdx]);
                             if (bakePolygon(wr, rp, ci, pi, overlayF,
                                             lightCells, lumels, partial[t],
                                             nullptr, overlayMask.data(),
-                                            dirPtr, lightList) &&
+                                            dirHere ? dirPtr : nullptr,
+                                            lightList) &&
                                 static_cast<int>(lumels.size()) ==
                                     e.pixelW * e.pixelH) {
                                 packLumelsRGB8(lumels, buf);
@@ -2259,6 +2307,40 @@ inline void bakeAtlasWithOverlays(const WRParsedData &wr,
                     // overlay per door-adjacent candidate not already
                     // recorded via animMap. The blend scales unmapped
                     // lights at intensity 1.0 — geometry-only overlays.
+                    // Snapshot the door-STATIC direction accumulation
+                    // (base + animMap overlays, already in polyDir) before
+                    // the door lights join it — the runtime recombine's
+                    // base term.
+                    if (!extraForPoly.empty() && dirPtr) {
+                        float magMax = 0.0f, wMax = 0.0f;
+                        for (const DirAccum &da : polyDir) {
+                            magMax = std::max(magMax, glm::length(da.sum));
+                            wMax = std::max(wMax, da.weight);
+                        }
+                        rec.dirBaseMagScale = magMax;
+                        rec.dirBaseWeightScale = wMax;
+                        rec.dirBase.resize(polyDir.size() * 4);
+                        for (size_t t2 = 0; t2 < polyDir.size(); ++t2) {
+                            const DirAccum &da = polyDir[t2];
+                            const float mag = glm::length(da.sum);
+                            float u2 = 0.5f, v2 = 0.5f;
+                            if (mag > 1e-6f)
+                                octahedralEncode(da.sum / mag, u2, v2);
+                            uint8_t *d4 = &rec.dirBase[t2 * 4];
+                            d4[0] = static_cast<uint8_t>(u2 * 255.0f);
+                            d4[1] = static_cast<uint8_t>(v2 * 255.0f);
+                            d4[2] = magMax > 1e-6f
+                                ? static_cast<uint8_t>(
+                                      std::min(1.0f, mag / magMax) * 255.0f)
+                                : 0;
+                            d4[3] = wMax > 1e-6f
+                                ? static_cast<uint8_t>(
+                                      std::min(1.0f, da.weight / wMax) *
+                                      255.0f)
+                                : 0;
+                        }
+                    }
+
                     // Door overlays: energy AND direction bake with the
                     // door occlusion hook — the direction field reflects
                     // the CURRENT door state, and door events re-bake it
@@ -2277,7 +2359,7 @@ inline void bakeAtlasWithOverlays(const WRParsedData &wr,
                         if (bakePolygon(wr, rp, ci, pi, overlayF,
                                         lightCells, lumels, partial[t],
                                         nullptr, overlayMask.data(),
-                                        dirPtr, lightList) &&
+                                        /*dirAccum=*/nullptr, lightList) &&
                             static_cast<int>(lumels.size()) ==
                                 e.pixelW * e.pixelH) {
                             packLumelsRGB8(lumels, buf);
