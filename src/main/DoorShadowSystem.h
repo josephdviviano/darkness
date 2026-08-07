@@ -319,6 +319,81 @@ public:
                 "[DOOR_SHADOW] most light-coupled doors: %s\n",
                 line.empty() ? "none" : line.c_str());
         }
+        // ── Live-light budget census ──
+        // The data that sizes LIVE_LIGHT_CAP: how many cone lights a
+        // single swing promotes (per-door unique lights, omni only —
+        // spots never promote), and the worst PLAUSIBLE simultaneous
+        // case: two doors near each other both swinging (player + AI),
+        // as the max union over door pairs within earshot of each other.
+        {
+            // Intensity gate: a light whose peak stored-space
+            // contribution AT THE DOOR is below ~8/255 cannot produce a
+            // visible shadow delta anywhere (the delta is bounded by the
+            // contribution) — counting it toward the cap would size the
+            // budget for invisible work.
+            std::unordered_map<int32_t, std::vector<int16_t>> doorLights;
+            for (const auto &dw : mDoorWork) {
+                const DoorShadowDoor *d = nullptr;
+                for (const auto &dd : mDoors)
+                    if (dd.objID == dw.first) { d = &dd; break; }
+                if (!d) continue;
+                auto &v = doorLights[dw.first];
+                for (const auto &pr : dw.second) {
+                    const WRStaticLight &L = mWr->staticLights[
+                        static_cast<size_t>(pr.second)];
+                    if (L.inner != -1.0f) continue;   // spot: never live
+                    if (doorIntensity(pr.second, *d) <
+                        kPromoteMinIntensity)
+                        continue;                     // invisible delta
+                    if (std::find(v.begin(), v.end(), pr.second) ==
+                        v.end())
+                        v.push_back(pr.second);
+                }
+            }
+            std::vector<size_t> counts;
+            for (const auto &dl : doorLights)
+                counts.push_back(dl.second.size());
+            std::sort(counts.begin(), counts.end());
+            size_t pairMax = 0;
+            int32_t pairA = 0, pairB = 0;
+            for (const auto &da : doorLights)
+                for (const auto &db : doorLights) {
+                    if (da.first >= db.first) continue;
+                    const DoorShadowDoor *dda = nullptr, *ddb = nullptr;
+                    for (const auto &dd : mDoors) {
+                        if (dd.objID == da.first) dda = &dd;
+                        if (dd.objID == db.first) ddb = &dd;
+                    }
+                    if (!dda || !ddb ||
+                        glm::length(dda->pos - ddb->pos) > 80.0f)
+                        continue;
+                    std::vector<int16_t> u = da.second;
+                    for (int16_t li : db.second)
+                        if (std::find(u.begin(), u.end(), li) == u.end())
+                            u.push_back(li);
+                    if (u.size() > pairMax) {
+                        pairMax = u.size();
+                        pairA = da.first;
+                        pairB = db.first;
+                    }
+                }
+            const size_t nD = counts.size();
+            std::fprintf(stderr,
+                "[DOOR_CENSUS] %zu light-coupled doors; VISIBLE-delta "
+                "(omni, >=8/255 at door) lights per door: max %zu p95 "
+                "%zu median %zu; doors needing >4: %zu, >8: %zu; worst "
+                "simultaneous pair (<=80u apart): %zu lights (doors "
+                "%d+%d)\n",
+                nD,
+                nD ? counts.back() : 0,
+                nD ? counts[static_cast<size_t>((nD - 1) * 0.95)] : 0,
+                nD ? counts[nD / 2] : 0,
+                static_cast<size_t>(std::count_if(counts.begin(),
+                    counts.end(), [](size_t c) { return c > 4; })),
+                static_cast<size_t>(std::count_if(counts.begin(),
+                    counts.end(), [](size_t c) { return c > 8; })),
+                pairMax, pairA, pairB);
+        }
         // ── Init-time direction recombine ──
         // Door-adjacent lights contribute no direction at LOAD (or the
         // runtime recombine would double-count them) — paint their term
@@ -1562,6 +1637,22 @@ private:
                    kSettleSec;
     }
 
+    // Peak stored-space contribution of a light at a door's swept
+    // sphere — the promotion priority AND the visibility gate (a
+    // door-shadow delta is bounded by the light's contribution there).
+    float doorIntensity(int16_t li, const DoorShadowDoor &d) const {
+        const WRStaticLight &L =
+            mWr->staticLights[static_cast<size_t>(li)];
+        const float dist =
+            std::max(1.0f, glm::length(L.loc - d.pos) - d.sweptRadius);
+        const float a2 =
+            mFormula.emitterRadius * mFormula.emitterRadius;
+        const Vector3 cK =
+            L.bright * (mFormula.brightScale * promoteK(li));
+        const float peak = std::max({cK.x, cK.y, cK.z});
+        return peak / (dist * dist + a2);
+    }
+
     // The bake's per-light intensity factor — same math as the event
     // submit path (K folded into the colour, shader stays formula-free).
     float promoteK(int16_t lightIdx) const {
@@ -1615,19 +1706,23 @@ private:
         }
         auto lw = mDoorWork.find(objID);
         if (lw == mDoorWork.end()) return;
-        // Unique cone lights of this door, nearest to the leaf first —
-        // when the cap truncates, the lights whose shadows the swing
-        // changes most keep their slots.
+        // Unique cone lights of this door, strongest-at-the-door first
+        // (intensity, not distance: a bright lamp two steps away beats
+        // a candle at the hinge) — when the cap truncates, the lights
+        // whose shadows the swing changes most keep their slots. The
+        // intensity gate drops lights whose delta cannot be seen.
         std::vector<int16_t> lights;
         for (const auto &pr : lw->second) {
-            if (std::find(lights.begin(), lights.end(), pr.second) ==
+            if (std::find(lights.begin(), lights.end(), pr.second) !=
                 lights.end())
-                lights.push_back(pr.second);
+                continue;
+            if (doorIntensity(pr.second, *d) < kPromoteMinIntensity)
+                continue;
+            lights.push_back(pr.second);
         }
         std::sort(lights.begin(), lights.end(),
                   [&](int16_t a, int16_t b) {
-                      return glm::length(mWr->staticLights[a].loc - d->pos) <
-                             glm::length(mWr->staticLights[b].loc - d->pos);
+                      return doorIntensity(a, *d) > doorIntensity(b, *d);
                   });
         for (int16_t li : lights) {
             PromotedLight *p = nullptr;
@@ -1729,10 +1824,16 @@ private:
     // physics ticks at 12.5 Hz (80 ms gaps between markDirty calls
     // mid-swing) — 0.3 s cannot false-settle a moving leaf.
     static constexpr float kSettleSec = 0.30f;
-    // Mirrors the shader's LIVE_LIGHT_CAP minus nothing — the frame
-    // loop merges these with the flashlight and enforces the real cap,
-    // logging any truncation.
-    static constexpr size_t kPromoteCap = 4;
+    // kLiveLightCap minus the flashlight's slot; the frame loop merges
+    // and enforces the real cap, logging any truncation. Each promotion
+    // holds TWO S1 slots (frozen + current) — kShadowMaxPoolSlots is
+    // sized to match.
+    static constexpr size_t kPromoteCap = 15;
+    // A light below this stored-space contribution AT THE DOOR cannot
+    // produce a visible shadow delta (the delta is bounded by the
+    // contribution) — it never earns a slot. Same gate the
+    // [DOOR_CENSUS] uses.
+    static constexpr float kPromoteMinIntensity = 8.0f / 255.0f;
     static constexpr int kPolysPerFrame = 48;
     static constexpr double kFrameMsBudget = 4.0;
     // Object-cache invalidation: door-scale radius, at most once per

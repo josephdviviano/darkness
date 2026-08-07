@@ -216,7 +216,11 @@ static constexpr bgfx::ViewId kViewGrain = kViewComposite + 4;
 //
 // kShadowMaxPoolSlots bounds the VIEW ID RESERVATION (and the runtime
 // pool); 6 is kShadowFaceCount (static_asserted in ShadowMapCache.h).
-static constexpr int kShadowMaxPoolSlots = 16;
+// 32 slots = 15 concurrent S4c differentials (2 slots each: frozen +
+// current) + the flashlight + margin — sized by the 2026-08-08 density
+// census (visible-delta lights per door: p95 11-26 across all missions)
+// against the bgfx 256-view budget (192 face views land ~241).
+static constexpr int kShadowMaxPoolSlots = 32;
 static constexpr bgfx::ViewId kViewShadowFaceFirst = kViewGrain + 1;
 // One id past the face range: the shadow debug HUD (draws the atlas tiles
 // to the backbuffer) and the readback blit both live here — both must run
@@ -230,6 +234,8 @@ static constexpr bgfx::ViewId kViewLumelBake = kViewShadowDebug + 1;
 // Blit/readback companion: bgfx executes a view's blits BEFORE its draw
 // items, so copying a lumel-bake result must happen on a LATER view.
 static constexpr bgfx::ViewId kViewLumelRead = kViewLumelBake + 1;
+static_assert(kViewLumelRead < 256,
+              "bgfx view budget exceeded — shrink kShadowMaxPoolSlots");
 
 /// Which engine's bloom construction to run.
 ///

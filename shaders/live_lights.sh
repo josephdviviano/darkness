@@ -20,7 +20,7 @@
 // share them (edit alongside ObjectIllumination/DoorShadow C++ sides).
 
 #ifndef LIVE_LIGHT_CAP
-#define LIVE_LIGHT_CAP 4
+#define LIVE_LIGHT_CAP 16
 #endif
 
 // .x = active light count (uniform flow — safe around derivatives)
