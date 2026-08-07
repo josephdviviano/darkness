@@ -151,6 +151,42 @@ public:
     // before any object is drawn.
     void setDynamicLights(const DynamicLightList *dyn) { mDyn = dyn; }
 
+    // Wire the physical-falloff mirror (see the member block below for the
+    // formula and why). `reach` and `anchors` are ShadowMapCache's
+    // lightReach / lightAnchor tables (the one authority); `anchor` /
+    // `emitterA` must be the bake's own falloff parameters. `anchors` may
+    // be null (pre-throw construction: one global anchor).
+    void setPhysicalFalloff(const std::vector<float> *reach,
+                            const std::vector<float> *anchors, float anchor,
+                            float emitterA) {
+        mPhysReach = reach;
+        mPhysAnchors = anchors;
+        const float a2 = emitterA * emitterA;
+        mPhysK  = anchor > 0.0f ? (anchor * anchor + a2) / anchor : 0.0f;
+        mPhysA2 = a2;
+    }
+
+    // K for one light: the throw-derived per-light anchor where wired,
+    // else the global one. Mirrors LightmapBake.h's anchorFor().
+    float physKFor(int32_t lightIdx) const {
+        if (mPhysAnchors && lightIdx >= 0 &&
+            lightIdx < static_cast<int32_t>(mPhysAnchors->size())) {
+            const float A = (*mPhysAnchors)[lightIdx];
+            if (A > 0.0f) return (A * A + mPhysA2) / A;
+        }
+        return mPhysK;
+    }
+
+    // Follows the DISPLAYED atlas each frame: physical while the re-baked
+    // physical atlas is bound, vintage otherwise (vintage stays exact).
+    void setPhysicalFalloffActive(bool active) {
+        mPhysActive = active && mPhysReach != nullptr && mPhysK > 0.0f;
+    }
+    bool physicalFalloffActive() const { return mPhysActive; }
+    // For the u_objectFalloff uniform (.y and .z lanes).
+    float physicalFalloffK() const { return mPhysK; }
+    float physicalFalloffA2() const { return mPhysA2; }
+
     // Set the brightness multiplier for one static-light slot. Used by the
     // animated lighting system to propagate AnimLight intensity changes
     // (FLICKER mode, brighten/dim transitions, on/off via tweqs) to the
@@ -230,6 +266,25 @@ private:
     PropertyService        *mPropSvc = nullptr;
     const DynamicLightList *mDyn     = nullptr;
     std::vector<float>      mLightMultiplier;  // per static-light brightness scale
+
+    // ── Physical-falloff mirror (PLAN.HIGH_RES_SHADOWS falloff work) ──
+    // When the DISPLAYED atlas is the physical re-bake, objects must be lit
+    // by the SAME model as the walls behind them: anchored inverse-square
+    // 1/(r²+a²) with GEOMETRIC reach, not the vintage 1/r with authored
+    // radius — the two disagree ~2× near lights and in opposite directions
+    // far from them, which reads as "objects don't match the room".
+    // mPhysReach points at ShadowMapCache::lightReach (the one reach
+    // authority — same physicalReachRadius the bake used, invariant #8).
+    // mPhysK/mPhysA2 mirror LightmapBake.h's physicalDistFactor():
+    //   factor(d) = (anchor²+a²)/(anchor·(d²+a²)) = K/(d²+a²)
+    // (that header includes this one, so the formula cannot be #included —
+    // edit both together). The ACTIVE flag follows the displayed atlas per
+    // frame: vintage mode must stay exactly vintage.
+    const std::vector<float> *mPhysReach = nullptr;
+    const std::vector<float> *mPhysAnchors = nullptr;  // per-light (throw)
+    float mPhysK      = 0.0f;
+    float mPhysA2     = 0.0f;
+    bool  mPhysActive = false;
 
     // Sun slot patched per-evaluation (`compute()` writes loc/bright before
     // applying the contribution). Held as a mutable member rather than a
@@ -470,10 +525,20 @@ inline void ObjectIlluminator::buildLightArray(int32_t objId,
     // distance and keep the nearest. The sun (idx 0) is exempt and
     // always packed first — at its patched far distance it would lose
     // every contest, but its directional contribution matters.
+    // Per-light `bright.w` encoding consumed by vs_textured_pervertex.sc:
+    //   w > 0 — cutoff at w (squared range); physical falloff when the
+    //           u_objectFalloff mode flag is on (static lights carry reach²
+    //           in physical mode, authored radius² in vintage — the flag is
+    //           off then, so the same encoding reads correctly either way)
+    //   w < 0 — cutoff at |w|, ALWAYS vintage 1/r (dynamic lights under
+    //           physical mode: no wall counterpart exists to match, and
+    //           their brightnesses were tuned against 1/r)
+    //   w = 0 — no cutoff, vintage 1/r (the sun's distance hack)
     struct Cand {
         const WRStaticLight *L;
         float multiplier;
         float dist2;
+        float w;
     };
     Cand cands[96];
     int candCount = 0;
@@ -497,8 +562,24 @@ inline void ObjectIlluminator::buildLightArray(int32_t objId,
         if (multiplier <= 0.0f) continue;
 
         const WRStaticLight &L = mWr->staticLights[lightIdx];
+        float w;
+        if (mPhysActive) {
+            const float reach =
+                (mPhysReach &&
+                 lightIdx < static_cast<int32_t>(mPhysReach->size()))
+                    ? (*mPhysReach)[lightIdx] : 0.0f;
+            if (reach <= 0.0f) continue;   // below quantisation: skip
+            w = reach * reach;
+            // Throw-derived per-light intensity: the shader computes the
+            // GLOBAL K/(d²+a²); fold s_i = K_i/K_global into the packed
+            // brightness so per-light anchors cost no uniform lanes.
+            if (mPhysK > 0.0f)
+                multiplier *= physKFor(lightIdx) / mPhysK;
+        } else {
+            w = L.radius > 0.0f ? L.radius * L.radius : 0.0f;
+        }
         Vector3 d = L.loc - pos;
-        cands[candCount++] = Cand{&L, multiplier, glm::dot(d, d)};
+        cands[candCount++] = Cand{&L, multiplier, glm::dot(d, d), w};
     }
 
     int sunReserve = hasSun ? 1 : 0;
@@ -521,8 +602,7 @@ inline void ObjectIlluminator::buildLightArray(int32_t objId,
         int slot = out.count++;
         out.loc[slot]    = glm::vec4(c.L->loc, c.L->inner);
         out.dir[slot]    = glm::vec4(c.L->dir, c.L->outer);
-        out.bright[slot] = glm::vec4(c.L->bright * c.multiplier,
-                                     c.L->radius > 0.0f ? c.L->radius * c.L->radius : 0.0f);
+        out.bright[slot] = glm::vec4(c.L->bright * c.multiplier, c.w);
     }
 
     // Step 6: dynamic lights — same portal raycast as `compute()`,
@@ -545,8 +625,11 @@ inline void ObjectIlluminator::buildLightArray(int32_t objId,
             int slot = out.count++;
             out.loc[slot]    = glm::vec4(dl.loc, -1.0f);
             out.dir[slot]    = glm::vec4(0.0f, 0.0f, 0.0f, 0.0f);
+            // Negative w under physical mode: cutoff at |w| but ALWAYS
+            // vintage 1/r (see the encoding comment above the Cand struct).
+            const float dw = dl.radius > 0.0f ? dl.radius * dl.radius : 0.0f;
             out.bright[slot] = glm::vec4(dl.bright,
-                                         dl.radius > 0.0f ? dl.radius * dl.radius : 0.0f);
+                                         mPhysActive ? -dw : dw);
         }
     }
 }
@@ -609,11 +692,24 @@ inline void ObjectIlluminator::applyOneLight(int32_t lightIdx,
         if (multiplier <= 0.0f) return;
     }
 
-    // Radius cutoff (skip lights that are out of range for this point).
-    if (lightIdx != 0 && L->radius > 0.0f) {
-        Vector3 d = pos - L->loc;
-        float dist2 = glm::dot(d, d);
-        if (dist2 > L->radius * L->radius) return;
+    // Range cutoff. Physical mode: GEOMETRIC reach — the same
+    // sub-quantisation sphere the wall bake used (already clamped by any
+    // authored radius), so a light stops on objects exactly where it stops
+    // on the walls. Vintage: the authored radius, exactly as the original.
+    if (lightIdx != 0) {
+        if (mPhysActive) {
+            const float reach =
+                (mPhysReach &&
+                 lightIdx < static_cast<int32_t>(mPhysReach->size()))
+                    ? (*mPhysReach)[lightIdx] : 0.0f;
+            if (reach <= 0.0f) return;   // below quantisation: lights nothing
+            Vector3 d = pos - L->loc;
+            if (glm::dot(d, d) > reach * reach) return;
+        } else if (L->radius > 0.0f) {
+            Vector3 d = pos - L->loc;
+            float dist2 = glm::dot(d, d);
+            if (dist2 > L->radius * L->radius) return;
+        }
     }
 
     // Spotlight cone: linear interpolation between cos(inner) (full bright)
@@ -636,9 +732,12 @@ inline void ObjectIlluminator::applyOneLight(int32_t lightIdx,
         if (scale <= 0.0f) return;
     }
 
-    // 1/r distance attenuation, applied per RGB channel. Matches the
-    // engine's CLUT-path attenuation. The animated-light multiplier scales
-    // the entire contribution from this slot.
+    // Distance attenuation, applied per RGB channel. Vintage: 1/r,
+    // matching the engine's CLUT-path attenuation. Physical mode:
+    // K/(d²+a²) — the anchored finite-emitter inverse-square the re-baked
+    // walls carry (mirror of LightmapBake.h physicalDistFactor; the sun
+    // slot keeps its vintage distance hack in both modes). The
+    // animated-light multiplier scales the entire contribution.
     Vector3 d = L->loc - pos;
     float mag = glm::length(d);
     if (mag < 1e-6f) {
@@ -648,7 +747,12 @@ inline void ObjectIlluminator::applyOneLight(int32_t lightIdx,
         total += L->bright * (scale * multiplier);
         return;
     }
-    total += L->bright * (scale * multiplier / mag);
+    if (mPhysActive && lightIdx != 0) {
+        total += L->bright * (scale * multiplier *
+                              (physKFor(lightIdx) / (mag * mag + mPhysA2)));
+    } else {
+        total += L->bright * (scale * multiplier / mag);
+    }
 }
 
 } // namespace Darkness

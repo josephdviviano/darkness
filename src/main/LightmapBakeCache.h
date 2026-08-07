@@ -60,12 +60,17 @@ constexpr uint32_t kLmBakeCacheMagic    = 0x424D4C44; // "DLMB" little-endian
 // v3: optional dominant-direction atlas appended to the blob.
 // v4: falloff-naturalisation parameters (reach hops, soft radius) in the key.
 // v5: physical-falloff parameters (mode, anchor) in the key.
-constexpr uint32_t kLmBakeCacheVersion  = 5;
+// v6: throw-derived intensity (throwAlpha) in the key.
+constexpr uint32_t kLmBakeCacheVersion  = 6;
 // Bump when the bake FORMULA changes meaning — i.e. when identical parameters
 // would now produce different lumels. Parameter changes do not need a bump;
 // they are part of the key.
 //   v2: Continuous storage grew the smooth toe at the zero-crossing.
-constexpr uint32_t kLmBakeFormulaVersion = 2;
+//   v3: bright synthesis no longer overwrites slots of anim lights WITHOUT
+//       overlays (static-baked lights keep disk bright in the base — the
+//       MISS6 cathedral-lamp overbright fix). The synthesis feeds the bake
+//       input, so identical parameters now produce a different base.
+constexpr uint32_t kLmBakeFormulaVersion = 3;
 
 struct LmBakeCacheKey {
     uint64_t missionHash = 0;
@@ -80,6 +85,7 @@ struct LmBakeCacheKey {
     float    softRadius = 0.0f;
     int32_t  falloffPhysical = 0;
     float    falloffAnchor = 0.0f;
+    float    throwAlpha = 0.0f;
 };
 
 // Where the cache lives: ~/darkness/{gameName}/baked_lightmaps/{mission}.lmbake
@@ -211,6 +217,7 @@ inline bool writeLightmapBakeCache(const std::string &cachePath,
     detail::put(hdr, key.softRadius);
     detail::put(hdr, key.falloffPhysical);
     detail::put(hdr, key.falloffAnchor);
+    detail::put(hdr, key.throwAlpha);
     detail::put(hdr, static_cast<uint32_t>(atlas.size));
     detail::put(hdr, static_cast<uint64_t>(blob.size()));
     detail::put(hdr, static_cast<uint64_t>(comp.size()));
@@ -247,7 +254,7 @@ inline bool readLightmapBakeCache(const std::string &cachePath,
     int32_t density = 0, samples = 0, ss = 0, bounceSamples = 0;
     int32_t reachExpand = 0, falloffPhysical = 0;
     float emitter = 0.0f, aoStrength = 0.0f, softRadius = 0.0f;
-    float falloffAnchor = 0.0f;
+    float falloffAnchor = 0.0f, throwAlpha = 0.0f;
     using detail::get;
     if (!get(raw, off, magic) || magic != kLmBakeCacheMagic) {
         whyMiss = "bad magic"; return false;
@@ -264,6 +271,7 @@ inline bool readLightmapBakeCache(const std::string &cachePath,
         !get(raw, off, bounceSamples) || !get(raw, off, aoStrength) ||
         !get(raw, off, reachExpand) || !get(raw, off, softRadius) ||
         !get(raw, off, falloffPhysical) || !get(raw, off, falloffAnchor) ||
+        !get(raw, off, throwAlpha) ||
         !get(raw, off, atlasSize) || !get(raw, off, rawSize) ||
         !get(raw, off, compSize)) {
         whyMiss = "truncated header"; return false;
@@ -275,7 +283,8 @@ inline bool readLightmapBakeCache(const std::string &cachePath,
         aoStrength != key.aoStrength || reachExpand != key.reachExpand ||
         softRadius != key.softRadius ||
         falloffPhysical != key.falloffPhysical ||
-        falloffAnchor != key.falloffAnchor) {
+        falloffAnchor != key.falloffAnchor ||
+        throwAlpha != key.throwAlpha) {
         whyMiss = "bake parameters differ"; return false;
     }
     if (off + compSize > raw.size()) { whyMiss = "truncated body"; return false; }

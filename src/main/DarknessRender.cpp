@@ -505,6 +505,12 @@ static void printHelp() {
         "                    DEV-ONLY: with --stress-doors armed, toggle exactly\n"
         "                    these door object IDs each cycle instead of the\n"
         "                    nearest-N pick (detour-class hypothesis runs).\n"
+        "  --stress-frob-obj \"a,b\"\n"
+        "                    DEV-ONLY: send FrobWorldEnd to exactly these object\n"
+        "                    IDs every ~3 s (5 s warmup) through ScriptManager —\n"
+        "                    the same message a real frob sends, so lever →\n"
+        "                    ControlDevice → script chains (light switches) run\n"
+        "                    without a mouse. Emits [STRESS_FROB] stderr lines.\n"
         "  --spawn-override \"x,y,z[,yaw]\"\n"
         "                    DEV-ONLY: force the camera/player start to this\n"
         "                    engine-feet position instead of the mission spawn\n"
@@ -3187,6 +3193,16 @@ static void renderObjects(
                                           arr.ambient.z, 0.0f };
                     bgfx::setUniform(gpu.u_objectLightCount,  countV);
                     bgfx::setUniform(gpu.u_objectAmbient,     ambientV);
+                    // Falloff mode for this draw's light array — follows
+                    // the DISPLAYED atlas (ObjectIlluminator holds the
+                    // per-frame flag; the array's .w signs were encoded
+                    // under the same flag, so the pair stays coherent).
+                    const float falloffV[4] = {
+                        state.objectIlluminator.physicalFalloffActive()
+                            ? 1.0f : 0.0f,
+                        state.objectIlluminator.physicalFalloffK(),
+                        state.objectIlluminator.physicalFalloffA2(), 0.0f };
+                    bgfx::setUniform(gpu.u_objectFalloff, falloffV);
                     if (arr.count > 0) {
                         bgfx::setUniform(gpu.u_objectLightLoc,
                             arr.loc, arr.count);
@@ -3536,6 +3552,38 @@ static void registerConsoleSettings(
         "light field is visible. Albedo detail otherwise masks the lumel grid "
         "completely. Lightmapped world geometry only — objects and sky are "
         "unaffected, which is itself informative");
+
+    dbgConsole.addFloat("shadow_debug", -1.0f, 4095.0f,
+        [&state]() { return static_cast<float>(state.shadowDebugLight); },
+        [&state, &gpu](float v) {
+            const int li = static_cast<int>(v);
+            if (li < 0) { state.shadowDebugLight = -1; return; }
+            if (!gpu.shadowCache.valid()) {
+                std::fprintf(stderr,
+                    "[FALLBACK] shadow_debug: shadow cache unavailable on "
+                    "this backend — staying off.\n");
+                return;
+            }
+            const auto &reach = gpu.shadowCache.lightReach;
+            if (li >= static_cast<int>(reach.size())) {
+                std::fprintf(stderr,
+                    "shadow_debug: light %d out of range (table has %zu) — "
+                    "staying at %d.\n", li, reach.size(),
+                    state.shadowDebugLight);
+                return;
+            }
+            if (reach[li] <= 0.0f || gpu.shadowCache.lightCell[li] < 0) {
+                std::fprintf(stderr,
+                    "shadow_debug: light %d casts nothing (reach %.2f, "
+                    "cell %d) — pick a castable light.\n",
+                    li, reach[li], gpu.shadowCache.lightCell[li]);
+                return;
+            }
+            state.shadowDebugLight = li;
+        },
+        "Shadow-map debug HUD (S1): draw this static light's six depth "
+        "faces as grayscale tiles (top row +X -X +Y, bottom -Y +Z -Z; "
+        "black = near, white = nothing within reach). -1 = off");
 
     dbgConsole.addBool("lightmap_point",
         [&state]() { return state.lightmapPointFilter; },
@@ -5496,7 +5544,23 @@ static void updateLightmaps(
                 changedLights.push_back(lightNum);
 
                 auto it = mission.animLightIndex.find(lightNum);
-                if (it == mission.animLightIndex.end()) continue;
+                if (it == mission.animLightIndex.end()) {
+                    // An anim light with NO baked overlays anywhere: the
+                    // shipped lightmaps never change for it (static-baked);
+                    // toggling moves object lighting only. Say so ONCE per
+                    // light — "the switch did nothing" and "the data has no
+                    // overlays" must be distinguishable without a debugger
+                    // (MISS6 switch 434 / cathedral lamps, 2026-08-06).
+                    static std::unordered_set<int16_t> sNoOverlayLogged;
+                    if (sNoOverlayLogged.insert(lightNum).second)
+                        std::fprintf(stderr,
+                            "[ANIM-LIGHT] light %d (obj %d) toggled but has "
+                            "NO lightmap overlays in the mission data — "
+                            "lightmaps stay as baked (original behaviour); "
+                            "object lighting animates\n",
+                            lightNum, light.objectId);
+                    continue;
+                }
 
                 for (auto &[ci, pi] : it->second) {
                     const auto &entry = gpu.lmAtlasSet.entries[ci][pi];
@@ -5579,15 +5643,24 @@ static void updateLightmaps(
                     static_cast<uint16_t>(w), static_cast<uint16_t>(h), mem);
             };
 
-            auto blendOne = [&](size_t idx) {
+            auto blendOne = [&](size_t idx, bool bypassVisibility) {
                 const auto &rec = gpu.rebakedAnimPolys[idx];
                 if (rec.ci >= gpu.rebakedAtlasSet.entries.size()) return;
                 // Continuous flicker skips polygons nobody can see; they
                 // refresh within a tick or two of becoming visible because
                 // the signal never stops crossing the threshold. Full blends
                 // never filter (they exist to erase staleness).
-                if (!fullBlend && flickerActive && visibleCells &&
-                    !visibleCells->empty() &&
+                //
+                // ENVELOPE changes (scripted switch toggles, vintage
+                // animation) must BYPASS this filter: they are one-shot —
+                // lastRebakedIntensity updates immediately, the threshold
+                // never trips again, and every polygon off-screen at the
+                // toggle instant would stay stale FOREVER. You frob a
+                // switch facing the switch; the room behind you is exactly
+                // what the filter would skip. (Bug found 2026-08-06:
+                // "switch-toggled lights don't work under the re-bake".)
+                if (!fullBlend && !bypassVisibility && flickerActive &&
+                    visibleCells && !visibleCells->empty() &&
                     visibleCells->count(rec.ci) == 0)
                     return;
                 const auto &cellEntries = gpu.rebakedAtlasSet.entries[rec.ci];
@@ -5611,7 +5684,7 @@ static void updateLightmaps(
 
             if (fullBlend) {
                 for (size_t i = 0; i < gpu.rebakedAnimPolys.size(); ++i)
-                    blendOne(i);
+                    blendOne(i, /*bypassVisibility=*/true);
                 if (rebakedForceAll) *rebakedForceAll = false;
                 uploadRect(0, 0, atlas.size, atlas.size);
                 for (auto &[lightNum, light] : mission.lightSources) {
@@ -5625,7 +5698,7 @@ static void updateLightmaps(
                 // the continuous signal); otherwise reuse the vintage
                 // changed-set the shipped loop recorded.
                 std::unordered_set<uint64_t> visited;
-                auto blendLight = [&](int16_t lightNum) {
+                auto blendLight = [&](int16_t lightNum, bool bypassVis) {
                     auto it = mission.animLightIndex.find(lightNum);
                     if (it == mission.animLightIndex.end()) return;
                     for (auto &[ci, pi] : it->second) {
@@ -5634,26 +5707,65 @@ static void updateLightmaps(
                             | static_cast<uint32_t>(pi);
                         if (!visited.insert(key).second) continue;
                         auto recIt = gpu.rebakedAnimIndex.find(key);
-                        if (recIt != gpu.rebakedAnimIndex.end())
-                            blendOne(recIt->second);
+                        if (recIt != gpu.rebakedAnimIndex.end()) {
+                            blendOne(recIt->second, bypassVis);
+                        } else {
+                            // A polygon the SHIPPED anim index animates but
+                            // OUR bake carries no overlay for: that light's
+                            // toggle silently does nothing there. Scream
+                            // once per light — this class is invisible in
+                            // any aggregate.
+                            static std::unordered_set<int16_t> sMissLogged;
+                            if (sMissLogged.insert(lightNum).second)
+                                std::fprintf(stderr,
+                                    "[FALLBACK] rebaked blend: light %d has "
+                                    "shipped anim polys (e.g. cell %u poly "
+                                    "%u) with NO re-baked overlay record — "
+                                    "its animation will not show on the "
+                                    "re-baked atlas\n",
+                                    lightNum, ci, pi);
+                        }
                     }
                 };
                 if (flickerActive) {
+                    // Vintage-envelope changes this frame (scripted toggles,
+                    // authored animation) — recorded by the shipped-atlas
+                    // loop above. These blend unconditionally AND bypass the
+                    // visible-cell filter; the flicker threshold gate below
+                    // is for the continuous cosmetic jitter only.
+                    std::unordered_set<int16_t> envelopeChanged(
+                        changedLights.begin(), changedLights.end());
                     for (auto &[lightNum, light] : mission.lightSources) {
                         auto it = effIntensities.find(lightNum);
                         if (it == effIntensities.end()) continue;
+                        const bool envelope =
+                            envelopeChanged.count(lightNum) != 0;
                         const float thr =
                             Darkness::lampTypeFlickers(light.lampType)
                                 ? kFlickerBlendThreshold : 0.002f;
-                        if (std::abs(it->second - light.lastRebakedIntensity)
+                        if (!envelope &&
+                            std::abs(it->second - light.lastRebakedIntensity)
                                 < thr)
                             continue;
                         light.lastRebakedIntensity = it->second;
-                        blendLight(lightNum);
+                        // Envelope events are rare, player-triggered, and
+                        // were once invisible when broken — log each one
+                        // with the intensity it blended at.
+                        if (envelope) {
+                            const size_t before = blends;
+                            blendLight(lightNum, true);
+                            std::fprintf(stderr,
+                                "[REBAKE_BLEND] envelope light %d -> "
+                                "intensity %.2f, %zu polys (filter "
+                                "bypassed)\n",
+                                lightNum, it->second, blends - before);
+                        } else {
+                            blendLight(lightNum, false);
+                        }
                     }
                 } else {
                     for (int16_t lightNum : changedLights)
-                        blendLight(lightNum);
+                        blendLight(lightNum, /*bypassVis=*/false);
                 }
             }
 
@@ -6927,12 +7039,30 @@ int main(int argc, char *argv[]) {
         // those torches. Using anim_max as the base gives the multiplier
         // a meaningful 0..1 range to modulate against.
         constexpr float kBakeLightScale = 32.0f;
-        int patched = 0;
+        int patched = 0, staticBaked = 0;
         for (const auto &[lightNum, idx] : mission.animLightToStaticIdx) {
             auto lsIt = mission.lightSources.find(lightNum);
             if (lsIt == mission.lightSources.end()) continue;
             const auto &ls = lsIt->second;
             if (ls.maxBright <= 0.0f) continue;
+
+            // Only lights with baked OVERLAYS get the max-bright overwrite.
+            // The overlay layer encodes each light's maximum, so its table
+            // slot must hold the max for the blend to scale correctly. But
+            // an AnimLight with NO overlay anywhere (MISS6's cathedral
+            // lamps 22/33/37/52, toggled by switch 434) was baked into the
+            // STATIC base at its disk bright — the original's lightmaps
+            // never change for it, only object lighting does. Overwriting
+            // its slot with anim_max (~3x disk for those lamps) made OUR
+            // static base bake them permanently overbright and unswitchable
+            // (found 2026-08-06, user report). Disk bright IS the static
+            // truth for these; the object-lighting multiplier then dims a
+            // correct base.
+            if (mission.animLightIndex.find(lightNum) ==
+                mission.animLightIndex.end()) {
+                ++staticBaked;
+                continue;
+            }
 
             float hue = 0.0f, sat = 0.0f;  // default white
             Darkness::PropLightColor col{};
@@ -6950,7 +7080,10 @@ int main(int argc, char *argv[]) {
             ++patched;
         }
         std::fprintf(stderr,
-            "  Synthesized bright for %d animated light slots\n", patched);
+            "  Synthesized bright for %d animated light slots "
+            "(%d anim lights have NO lightmap overlays — static-baked, "
+            "disk bright kept; their switches change object lighting "
+            "only)\n", patched, staticBaked);
 
         state.objectIlluminator.setMissionData(&mission.wrData,
                                                &mission.renderParams,
@@ -7608,6 +7741,25 @@ int main(int argc, char *argv[]) {
     // that says which lights the player can actually see hanging on
     // something. Uses the same resPath the object textures came from.
     initCoronas(mission, resPath, cfg.coronasSynthesized, state, gpu);
+
+    // Wire the physical-falloff mirror into per-object lighting: the reach
+    // and per-light anchor tables live in the shadow cache (computed there
+    // from the same bake parameters — one authority, invariant #8). The
+    // ACTIVE flag is set per frame in the render loop, following the
+    // displayed atlas.
+    state.objectIlluminator.setPhysicalFalloff(
+        &gpu.shadowCache.lightReach, &gpu.shadowCache.lightAnchor,
+        cfg.rebakeFalloffAnchor, cfg.rebakeEmitter);
+
+    // ── S1 acceptance: shadow-map vs raycastWorld cross-check ──
+    // Startup diagnostic (--shadow-crosscheck): renders a pool of lights'
+    // faces, reads the atlas back, and compares N random (point, light)
+    // face lookups against the CPU raycaster. Runs its own bgfx frames, so
+    // it must sit before the main loop. [SHADOW_XCHECK] stderr lines.
+    if (cfg.shadowCrossCheckPairs > 0) {
+        Darkness::runShadowCrossCheck(gpu.shadowCache, mission.wrData,
+                                      cfg.shadowCrossCheckPairs);
+    }
 
     // ── Post-process: HDR scene target + composite pass ──
     //
@@ -8365,6 +8517,15 @@ int main(int argc, char *argv[]) {
 
             bool scriptDirty = lightScriptSvc.dirty;
             if (scriptDirty) lightScriptSvc.dirty = false;
+            // Object lighting follows the DISPLAYED atlas: physical
+            // falloff+reach while the physical re-bake is bound (walls and
+            // objects must agree on the light model), vintage otherwise.
+            // Evaluated per frame so the `rebaked_lightmaps` console A/B
+            // flips objects and walls TOGETHER.
+            state.objectIlluminator.setPhysicalFalloffActive(
+                state.useRebakedLightmaps &&
+                !gpu.rebakedAtlasHandles.empty() &&
+                cfg.rebakeFalloffPhysical);
             updateLightmaps(dt, meshes, mission, gpu,
                             state.objectIlluminator,
                             state.debugAnimLightmaps, state.forceFlicker,
@@ -8457,6 +8618,24 @@ int main(int argc, char *argv[]) {
             // ── Debug raycast visualization (view 2) ──
             renderDebugOverlay(fc, gpu, mission, state);
 
+            // ── Shadow-face debug HUD (S1) ──
+            // ensure + draw each frame: ensure is a no-op while the slot is
+            // valid (the HPL2 validity check), so the faces render once and
+            // the HUD merely samples the atlas afterwards.
+            if (state.shadowDebugLight >= 0 && gpu.shadowCache.valid()) {
+                const int slot = Darkness::ensureShadowLight(
+                    gpu.shadowCache, mission.wrData, state.shadowDebugLight,
+                    state.frameIndex);
+                if (slot >= 0) {
+                    Darkness::submitShadowDebugHud(
+                        gpu.shadowCache, slot,
+                        static_cast<uint32_t>(WINDOW_WIDTH),
+                        static_cast<uint32_t>(WINDOW_HEIGHT));
+                }
+                // The label prints below, after dbgTextClear() — text
+                // written here would be wiped before display.
+            }
+
             // ── Bloom blur chain, then composite to the backbuffer ──
             // Runs after every scene view has been submitted. bgfx orders
             // views by id, so the blur passes and then the composite resolve
@@ -8541,6 +8720,17 @@ int main(int argc, char *argv[]) {
                 bgfx::dbgTextPrintf(2, 2, 0x4f,
                     "UNIFORM BUDGET EXCEEDED — %u object draws dropped",
                     state.frameUniformDrawsDropped);
+            }
+
+            // Shadow-face HUD label (quads submitted above, before the
+            // post chain; the text has to wait until after dbgTextClear).
+            if (state.shadowDebugLight >= 0 && gpu.shadowCache.valid()) {
+                bgfx::dbgTextPrintf(2, 4, 0x0b,
+                    "SHADOW light %d reach %.1f face %d^2 — tiles right: "
+                    "+X -X +Y / -Y +Z -Z (shadow_debug -1 closes)",
+                    state.shadowDebugLight,
+                    gpu.shadowCache.lightReach[state.shadowDebugLight],
+                    gpu.shadowCache.faceSize);
             }
 
             // Camera position HUD (only when show_pos is on). Row 0 so
@@ -8732,8 +8922,37 @@ int main(int argc, char *argv[]) {
     // doors continuously animating — the O2a [DOOR_ROUTE_LATENCY] load.
     float stressDoorsNextToggleSec = 5.0f;
     int   stressDoorsCycle = 0;
+    // DEV-ONLY --stress-frob-obj: parsed object-ID list + toggle timer.
+    // Sends FrobWorldEnd exactly the way FrobSystem::executeFrob does.
+    std::vector<int32_t> stressFrobIds;
+    if (!cfg.stressFrobObjs.empty()) {
+        std::stringstream sfs(cfg.stressFrobObjs);
+        std::string tok;
+        while (std::getline(sfs, tok, ','))
+            if (!tok.empty()) stressFrobIds.push_back(std::atoi(tok.c_str()));
+        std::fprintf(stderr,
+            "--stress-frob-obj: will send FrobWorldEnd to %zu object(s) "
+            "every ~3 s after a 5 s warmup\n", stressFrobIds.size());
+    }
+    float stressFrobNextSec = 5.0f;
     while (state.running && !loopSvc->isTerminationRequested()) {
         loopSvc->step();
+        if (!stressFrobIds.empty()) {
+            float elapsed = std::chrono::duration<float>(
+                std::chrono::steady_clock::now() - mainLoopStart).count();
+            if (elapsed >= stressFrobNextSec) {
+                stressFrobNextSec = elapsed + 3.0f;
+                for (int32_t objId : stressFrobIds) {
+                    std::fprintf(stderr,
+                        "[STRESS_FROB] FrobWorldEnd -> obj %d\n", objId);
+                    Darkness::ScriptMessage msg;
+                    msg.to = objId;
+                    msg.name = "FrobWorldEnd";
+                    msg.from = 0;   // player, like a real frob
+                    scriptManager.sendMessageWithLinks(msg);
+                }
+            }
+        }
         if (cfg.exitAfterSeconds > 0.0f && !exitAfterFired) {
             float elapsed = std::chrono::duration<float>(
                 std::chrono::steady_clock::now() - mainLoopStart).count();

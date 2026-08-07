@@ -1130,6 +1130,8 @@ static bool createGPUResources(const Darkness::MissionData &mission,
     // (shaders/object_lighting_constants.h ↔ kObjectLightCap).
     gpu.u_objectLightCount  = bgfx::createUniform(
         "u_objectLightCount",  bgfx::UniformType::Vec4);
+    gpu.u_objectFalloff     = bgfx::createUniform(
+        "u_objectFalloff",     bgfx::UniformType::Vec4);
     gpu.u_objectAmbient     = bgfx::createUniform(
         "u_objectAmbient",     bgfx::UniformType::Vec4);
     gpu.u_objectLightLoc    = bgfx::createUniform(
@@ -1226,6 +1228,7 @@ static bool createGPUResources(const Darkness::MissionData &mission,
                 bf.softRadiusFrac   = cfg.rebakeSoftRadius;
                 bf.falloffPhysical  = cfg.rebakeFalloffPhysical;
                 bf.falloffAnchor    = cfg.rebakeFalloffAnchor;
+                bf.throwAlpha       = cfg.rebakeThrowAlpha;
                 Darkness::BakeStats bs;
                 // Scale the packing by the density. Normalised UVs are
                 // invariant under that scale, so the world mesh built for the
@@ -1256,6 +1259,8 @@ static bool createGPUResources(const Darkness::MissionData &mission,
                 ckey.softRadius    = cfg.rebakeSoftRadius;
                 ckey.falloffPhysical = cfg.rebakeFalloffPhysical ? 1 : 0;
                 ckey.falloffAnchor   = cfg.rebakeFalloffAnchor;
+                ckey.throwAlpha      = cfg.rebakeFalloffPhysical
+                                           ? cfg.rebakeThrowAlpha : 0.0f;
 
                 std::vector<Darkness::RebakedAnimPoly> animPolys;
                 Darkness::AtlasTexture dirAtlas;
@@ -1476,6 +1481,123 @@ static bool createGPUResources(const Darkness::MissionData &mission,
                 }
                 gpu.rebakedDensity = bf.density;
 
+                // ── [LUM_RATIO] — the gameplay-relevant acceptance number ──
+                // Per-polygon mean luminance of OUR bake against the SHIPPED
+                // atlas, static polys only (animated polys hold unblended
+                // overlays here, and the shipped side holds save-time blend
+                // state — not comparable). Light is gameplay (the lightgem
+                // reads these lumels), so "how bright is the physical bake
+                // vs the authored look" must be a printed number, not an
+                // impression. Ratios are texel-weighted; dark shipped polys
+                // (< 2/255) are skipped as ratio-unstable.
+                {
+                    const auto &shipAtlas = gpu.lmAtlasSet.atlases[0];
+                    const auto &ourAtlas  = gpu.rebakedAtlasSet.atlases[0];
+                    std::vector<std::pair<float, float>> ratios; // ratio, w
+                    std::vector<std::pair<float, float>> shadowRatios;
+                    std::vector<std::pair<float, float>> shadowDeltas;
+                    double wSum = 0.0, wrSum = 0.0;
+                    size_t skippedDark = 0, skippedAnim = 0;
+                    auto polyMean = [](const Darkness::AtlasTexture &at,
+                                       const Darkness::LmapEntry &e) {
+                        double sum = 0.0;
+                        size_t n = 0;
+                        for (int y = 0; y < e.pixelH; ++y) {
+                            const size_t row =
+                                (static_cast<size_t>(e.pixelY) + y) * at.size;
+                            for (int x = 0; x < e.pixelW; ++x) {
+                                const size_t px =
+                                    (row + e.pixelX + x) * 4;
+                                if (px + 2 >= at.rgba.size()) continue;
+                                sum += 0.2126 * at.rgba[px] +
+                                       0.7152 * at.rgba[px + 1] +
+                                       0.0722 * at.rgba[px + 2];
+                                ++n;
+                            }
+                        }
+                        return n ? sum / n : 0.0;
+                    };
+                    const size_t nc = std::min(
+                        gpu.lmAtlasSet.entries.size(),
+                        gpu.rebakedAtlasSet.entries.size());
+                    for (size_t ci = 0; ci < nc; ++ci) {
+                        const auto &se = gpu.lmAtlasSet.entries[ci];
+                        const auto &re = gpu.rebakedAtlasSet.entries[ci];
+                        const size_t np = std::min(se.size(), re.size());
+                        for (size_t pi = 0; pi < np; ++pi) {
+                            const uint64_t key =
+                                (static_cast<uint64_t>(ci) << 32)
+                                | static_cast<uint32_t>(pi);
+                            if (gpu.rebakedAnimIndex.count(key)) {
+                                ++skippedAnim;
+                                continue;
+                            }
+                            const double sm = polyMean(shipAtlas, se[pi]);
+                            if (sm < 2.0) { ++skippedDark; continue; }
+                            const double rm = polyMean(ourAtlas, re[pi]);
+                            const float w = static_cast<float>(
+                                se[pi].pixelW * se[pi].pixelH);
+                            ratios.push_back(
+                                {static_cast<float>(rm / sm), w});
+                            if (sm < 48.0) {
+                                shadowRatios.push_back(
+                                    {static_cast<float>(rm / sm), w});
+                                // Absolute delta in /255 counts — ratios
+                                // overstate change on dim bases, and the
+                                // lightgem cares about counts, not ratios.
+                                shadowDeltas.push_back(
+                                    {static_cast<float>(rm - sm), w});
+                            }
+                            wSum += w;
+                            wrSum += w * (rm / sm);
+                        }
+                    }
+                    if (!ratios.empty()) {
+                        std::sort(ratios.begin(), ratios.end());
+                        auto wpct = [&](std::vector<std::pair<float, float>>
+                                            &v, double q) {
+                            double tot = 0.0;
+                            for (const auto &[r, w] : v) tot += w;
+                            double acc = 0.0;
+                            for (const auto &[r, w] : v) {
+                                acc += w;
+                                if (acc >= q * tot) return r;
+                            }
+                            return v.back().first;
+                        };
+                        std::fprintf(stderr,
+                            "[LUM_RATIO] ours/shipped per-poly mean "
+                            "luminance (throw-alpha %.2f, %zu static polys; "
+                            "%zu dark + %zu animated skipped): p5=%.2f "
+                            "p50=%.2f p95=%.2f weighted-mean=%.2f\n",
+                            bf.throwAlpha, ratios.size(), skippedDark,
+                            skippedAnim, wpct(ratios, 0.05),
+                            wpct(ratios, 0.50), wpct(ratios, 0.95),
+                            wSum > 0.0 ? wrSum / wSum : 0.0);
+                        // The STEALTH subset: polys the shipped atlas keeps
+                        // dim (< 48/255 mean — hiding-spot territory). The
+                        // lightgem will read whichever atlas is bound, so a
+                        // shadow the original kept dark must not brighten.
+                        // shadowRatios was collected alongside.
+                        if (!shadowRatios.empty()) {
+                            std::sort(shadowRatios.begin(),
+                                      shadowRatios.end());
+                            std::sort(shadowDeltas.begin(),
+                                      shadowDeltas.end());
+                            std::fprintf(stderr,
+                                "[LUM_RATIO] shipped-DIM polys only "
+                                "(mean < 48/255, %zu polys): ratio "
+                                "p50=%.2f p95=%.2f | delta/255 p50=%+.1f "
+                                "p95=%+.1f — the stealth-relevant tail\n",
+                                shadowRatios.size(),
+                                wpct(shadowRatios, 0.50),
+                                wpct(shadowRatios, 0.95),
+                                wpct(shadowDeltas, 0.50),
+                                wpct(shadowDeltas, 0.95));
+                        }
+                    }
+                }
+
                 if (!fromCache)
                     std::fprintf(stderr,
                         "Re-baked lightmaps: %llu lumels, %llu rays "
@@ -1496,6 +1618,35 @@ static bool createGPUResources(const Darkness::MissionData &mission,
                     "one.\n");
             }
         }
+    }
+
+    // ── Shadow-map face pool (S1, PLAN.HIGH_RES_SHADOWS.md) ──
+    // Sits AFTER the animated-light bright synthesis above so each light's
+    // reach derives from its MAXIMUM brightness, and uses the bake's own
+    // falloff parameters so the reach spheres agree with the bake's
+    // (handoff invariant #8 — kSubQuantThreshold is shared). Independent of
+    // render mode: the caster mesh is its own solid-polygon triangulation,
+    // not the render mesh.
+    {
+        bgfx::ProgramHandle shadowDepthProg = bgfx::createProgram(
+            bgfx::createEmbeddedShader(s_embeddedShaders, rendererType,
+                                       "vs_shadow_depth"),
+            bgfx::createEmbeddedShader(s_embeddedShaders, rendererType,
+                                       "fs_shadow_depth"),
+            true);
+        // HUD reuses vs_textured; only the fragment stage is new.
+        bgfx::ProgramHandle shadowDebugProg = bgfx::createProgram(
+            bgfx::createEmbeddedShader(s_embeddedShaders, rendererType,
+                                       "vs_textured"),
+            bgfx::createEmbeddedShader(s_embeddedShaders, rendererType,
+                                       "fs_shadow_debug"),
+            true);
+        const Darkness::BakeFormula reachDefaults; // brightScale = bake default
+        Darkness::initShadowMapCache(
+            gpu.shadowCache, mission.wrData, cfg.rebakeFalloffAnchor,
+            cfg.rebakeEmitter, reachDefaults.brightScale,
+            cfg.rebakeFalloffPhysical ? cfg.rebakeThrowAlpha : 0.0f,
+            cfg.shadowFaceSize, shadowDepthProg, shadowDebugProg);
     }
 
     // ── Build geometry and create GPU buffers ──
@@ -2067,6 +2218,9 @@ static void initRuntimeState(
 // Destroy all bgfx GPU resources created during initialization.
 static void destroyGPUResources(Darkness::GPUResources &gpu)
 {
+    // Shadow-map face pool (owns its atlas, caster mesh and programs)
+    Darkness::destroyShadowMapCache(gpu.shadowCache);
+
     // Water surface buffers and flow textures
     if (bgfx::isValid(gpu.waterVBH)) bgfx::destroy(gpu.waterVBH);
     if (bgfx::isValid(gpu.waterIBH)) bgfx::destroy(gpu.waterIBH);
@@ -2118,6 +2272,7 @@ static void destroyGPUResources(Darkness::GPUResources &gpu)
     bgfx::destroy(gpu.u_lmAtlasSize);
     bgfx::destroy(gpu.u_lightmapScale);
     bgfx::destroy(gpu.u_objectLightCount);
+    bgfx::destroy(gpu.u_objectFalloff);
     bgfx::destroy(gpu.u_objectAmbient);
     bgfx::destroy(gpu.u_objectLightLoc);
     bgfx::destroy(gpu.u_objectLightDir);

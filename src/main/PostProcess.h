@@ -205,6 +205,25 @@ static constexpr bgfx::ViewId kViewSmaaBlend   = kViewComposite + 3;
 // where it did before — composite or SMAA blend straight to the backbuffer.
 static constexpr bgfx::ViewId kViewGrain = kViewComposite + 4;
 
+// ── Shadow-map faces (S1, PLAN.HIGH_RES_SHADOWS.md) — the TAIL of the view
+// range, after every screen pass. Face renders target the shadow atlas
+// framebuffer, so their position in the order only matters relative to
+// consumers of the atlas: sitting at the tail means an update submitted
+// during a frame lands one frame late for same-frame readers, which is
+// acceptable for S3's door events (revisit with bgfx::setViewOrder if S4
+// needs same-frame). One view per (pool slot, face): each carries its own
+// viewport rect into the tiled atlas and its own face view-projection.
+//
+// kShadowMaxPoolSlots bounds the VIEW ID RESERVATION (and the runtime
+// pool); 6 is kShadowFaceCount (static_asserted in ShadowMapCache.h).
+static constexpr int kShadowMaxPoolSlots = 16;
+static constexpr bgfx::ViewId kViewShadowFaceFirst = kViewGrain + 1;
+// One id past the face range: the shadow debug HUD (draws the atlas tiles
+// to the backbuffer) and the readback blit both live here — both must run
+// AFTER every face render, and neither targets the atlas.
+static constexpr bgfx::ViewId kViewShadowDebug =
+    kViewShadowFaceFirst + kShadowMaxPoolSlots * 6;
+
 /// Which engine's bloom construction to run.
 ///
 /// Not two tunings of one effect — two different places to decide what

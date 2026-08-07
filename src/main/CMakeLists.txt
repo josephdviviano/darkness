@@ -71,6 +71,36 @@ bgfx_compile_shaders(
     AS_HEADERS
 )
 
+# Shadow-face depth pass (S1) — linear distance into R32F faces
+bgfx_compile_shaders(
+    TYPE VERTEX
+    SHADERS ${SHADER_DIR}/vs_shadow_depth.sc
+    VARYING_DEF ${SHADER_DIR}/varying_shadow.def.sc
+    OUTPUT_DIR ${GENERATED_SHADER_DIR}
+    OUT_FILES_VAR SHADOW_DEPTH_VS_OUTPUTS
+    INCLUDE_DIRS ${SHADER_DIR}
+    AS_HEADERS
+)
+bgfx_compile_shaders(
+    TYPE FRAGMENT
+    SHADERS ${SHADER_DIR}/fs_shadow_depth.sc
+    VARYING_DEF ${SHADER_DIR}/varying_shadow.def.sc
+    OUTPUT_DIR ${GENERATED_SHADER_DIR}
+    OUT_FILES_VAR SHADOW_DEPTH_FS_OUTPUTS
+    INCLUDE_DIRS ${SHADER_DIR}
+    AS_HEADERS
+)
+# Shadow-face debug HUD (S1) — fragment-only, reuses vs_textured
+bgfx_compile_shaders(
+    TYPE FRAGMENT
+    SHADERS ${SHADER_DIR}/fs_shadow_debug.sc
+    VARYING_DEF ${SHADER_DIR}/varying_textured.def.sc
+    OUTPUT_DIR ${GENERATED_SHADER_DIR}
+    OUT_FILES_VAR SHADOW_DEBUG_FS_OUTPUTS
+    INCLUDE_DIRS ${SHADER_DIR}
+    AS_HEADERS
+)
+
 # Lightmapped shader — uses varying_lightmapped.def.sc
 bgfx_compile_shaders(
     TYPE VERTEX
@@ -400,6 +430,8 @@ add_custom_target(compile_shaders DEPENDS
     ${SMAA_EDGES_VS_OUTPUTS}   ${SMAA_EDGES_FS_OUTPUTS}
     ${SMAA_WEIGHTS_VS_OUTPUTS} ${SMAA_WEIGHTS_FS_OUTPUTS}
     ${SMAA_BLEND_VS_OUTPUTS}   ${SMAA_BLEND_FS_OUTPUTS}
+    ${SHADOW_DEPTH_VS_OUTPUTS} ${SHADOW_DEPTH_FS_OUTPUTS}
+    ${SHADOW_DEBUG_FS_OUTPUTS}
     ${CMAKE_CURRENT_BINARY_DIR}/.pervertex_constants_stamp
     ${CMAKE_CURRENT_BINARY_DIR}/.corona_shared_stamp
     ${CMAKE_CURRENT_BINARY_DIR}/.smaa_shared_stamp

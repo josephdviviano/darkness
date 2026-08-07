@@ -27,6 +27,7 @@ add_executable(darkness_tests
     test_subobject_joints.cpp
     test_coronas.cpp
     test_flicker_synthesis.cpp
+    test_shadow_face_math.cpp
     test_door_portal_binding.cpp
     test_config_help.cpp
 )

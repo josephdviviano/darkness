@@ -48,6 +48,7 @@
 #include "LightmapAtlas.h"
 #include "LightmapBake.h"
 #include "LightingSystem.h"
+#include "ShadowMapCache.h"
 #include "SpecularMaterials.h"
 #include "ObjectPropParser.h"
 #include "BinMeshParser.h"
@@ -216,6 +217,8 @@ struct GPUResources {
     // shaders/object_lighting_constants.h, mirrored to C++ in
     // ObjectIllumination.h).
     bgfx::UniformHandle u_objectLightCount  = BGFX_INVALID_HANDLE;  // .x = count
+    // Physical-falloff mirror flag+params (see vs_textured_pervertex.sc).
+    bgfx::UniformHandle u_objectFalloff     = BGFX_INVALID_HANDLE;
     bgfx::UniformHandle u_objectAmbient     = BGFX_INVALID_HANDLE;  // .rgb = ambient + ExtraLight
     bgfx::UniformHandle u_objectLightLoc    = BGFX_INVALID_HANDLE;  // vec4 × cap
     bgfx::UniformHandle u_objectLightDir    = BGFX_INVALID_HANDLE;  // vec4 × cap
@@ -289,6 +292,11 @@ struct GPUResources {
     // Owns its own teardown via destroyPostProcess(), including the
     // composite program, so it is not part of the program block above.
     PostProcessResources postProcess;
+
+    // Shadow-map face pool (S1, PLAN.HIGH_RES_SHADOWS.md). Owns its own
+    // teardown via destroyShadowMapCache(), including its two programs,
+    // mirroring the postProcess pattern.
+    ShadowMapCache shadowCache;
 };
 
 // ── Per-frame uniform-buffer budget ──
@@ -343,11 +351,11 @@ constexpr uint32_t uniformAlignUp(uint32_t bytes) {
 }
 
 // Per-vertex object draw: vs = u_model[1] (64) + u_modelView (64) +
-// u_modelViewProj (64) + u_objectLightCount/u_objectAmbient/u_objectParams
-// (3×16) + 3 light arrays (3 × kObjectLightCap × 16) = 1776; fs =
-// u_fogColor + u_fogParams + u_objectParams (48).
+// u_modelViewProj (64) + u_objectLightCount/u_objectAmbient/u_objectParams/
+// u_objectFalloff (4×16) + 3 light arrays (3 × kObjectLightCap × 16) = 1792;
+// fs = u_fogColor + u_fogParams + u_objectParams (48).
 constexpr uint32_t kUniformCostObjectPerVertexDraw =
-    uniformAlignUp(64u * 3u + 16u * 3u
+    uniformAlignUp(64u * 3u + 16u * 4u
                    + 3u * static_cast<uint32_t>(kObjectLightCap) * 16u)
     + uniformAlignUp(48u);
 
@@ -429,6 +437,10 @@ struct RuntimeState {
     // polygons nobody can see. Empty = no filtering (culling disabled), the
     // same convention the render passes use.
     std::unordered_set<uint32_t> lastVisibleCells;
+    // Shadow-face debug HUD (S1): static-light index whose six depth faces
+    // draw as tiles on the right of the screen. -1 = off. Set via the
+    // `shadow_debug` console setting.
+    int shadowDebugLight = -1;
     // Lighting-only debug view: replace world albedo with white so the raw
     // light field is visible. Against a real 64x64 stone texture the ~1
     // world-unit lumel grid is masked by albedo detail — this is what makes

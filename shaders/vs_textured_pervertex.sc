@@ -25,12 +25,28 @@ $output v_color0, v_texcoord0, v_fogDist
 //   u_objectLightDir[i]    .xyz = spotlight direction (zero for omni)
 //                          .w   = cos(outer) for spotlight
 //   u_objectLightBright[i] .rgb = pre-scaled radiant intensity
-//                          .w   = radius^2 (0 = no cutoff)
+//                          .w   = squared range; sign selects the falloff:
+//                                 > 0  cutoff at w, physical falloff when
+//                                      u_objectFalloff.x is on (reach² in
+//                                      physical mode, radius² in vintage)
+//                                 < 0  cutoff at |w|, ALWAYS vintage 1/r
+//                                      (dynamic lights under physical mode)
+//                                 = 0  no cutoff, vintage 1/r (the sun)
 uniform vec4 u_objectLightCount;
 uniform vec4 u_objectAmbient;
 uniform vec4 u_objectLightLoc[OBJECT_LIGHT_CAP];
 uniform vec4 u_objectLightDir[OBJECT_LIGHT_CAP];
 uniform vec4 u_objectLightBright[OBJECT_LIGHT_CAP];
+
+// Physical-falloff mirror (ObjectIllumination.h `setPhysicalFalloff` is the
+// C++ side — edit both together):
+//   .x = mode flag (0 = vintage 1/r everywhere, 1 = physical for w > 0)
+//   .y = K  = (anchor² + a²) / anchor
+//   .z = a² = emitter radius squared
+// Physical factor(d) = K / (d² + a²) — the anchored finite-emitter
+// inverse-square the re-baked lightmaps carry, so objects match the walls
+// behind them while that atlas is displayed.
+uniform vec4 u_objectFalloff;
 
 // u_objectParams.z carries the current submesh's material illum (0..1):
 // per-material self-illumination, additive on top of the Lambertian sum.
@@ -61,19 +77,28 @@ void main()
         vec3 v = locW.xyz - worldPos;
         float dist2 = dot(v, v);
 
-        // Radius cutoff (matches the engine's per-light radius field).
-        float radius2 = u_objectLightBright[i].w;
-        if (radius2 > 0.0 && dist2 > radius2) continue;
+        // Range cutoff (reach² or radius² — |w|; see the encoding above).
+        float w = u_objectLightBright[i].w;
+        float cutoff2 = abs(w);
+        if (cutoff2 > 0.0 && dist2 > cutoff2) continue;
 
-        // Lambertian × inverse-linear: lt = cos(theta) / dist.
+        // Lambertian × falloff. Vintage: lt = cos(theta) / dist —
         //   (N · v) / |v|^2 = (|v| cos(theta)) / |v|^2 = cos(theta) / |v|
         // (|N| = 1 since worldNormal is normalized.) Watch the divisor:
         // dividing by dist instead of dist^2 here gives plain cos(theta)
         // with no distance falloff — every vertex within the radius
         // saturates the 1.0 clamp and the engine looks blown out.
+        // Physical (mode on, w > 0): cos(theta) × K/(d²+a²), matching the
+        // re-baked walls.
         // Backface (lt <= 0) contributes nothing — Lambertian half-space.
         float dist = sqrt(max(dist2, 1e-12));
-        float lt = dot(worldNormal, v) / max(dist2, 1e-12);
+        float lt;
+        if (u_objectFalloff.x > 0.5 && w > 0.0) {
+            lt = dot(worldNormal, v) / dist
+               * (u_objectFalloff.y / (dist2 + u_objectFalloff.z));
+        } else {
+            lt = dot(worldNormal, v) / max(dist2, 1e-12);
+        }
         if (lt <= 0.0) continue;
 
         // Spotlight cone falloff. inner == -1 sentinel ⇒ omni.

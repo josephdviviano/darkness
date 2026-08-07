@@ -1277,6 +1277,39 @@ static int runLightmapOverlaysVerb(const std::string &misPath, int stride) {
     uint64_t zeroDiskBright = 0;
     int examples = 0;
 
+    // Per-lightnum animMap census, INDEPENDENT of the stride and of whether
+    // the overlay pixel data is readable: how many animflags bits reference
+    // each lightnum, and how many of those carry decodable lumel data. A
+    // light whose bits outnumber its readable overlays is a light the
+    // runtime blend thinks it can animate but has no pixels for — the
+    // "switch toggles, lightmaps can't respond" class (MISS6 switch 434).
+    struct BitCensus { int bits = 0; int readable = 0; };
+    std::map<int16_t, BitCensus> bitCensus;
+    {
+        std::vector<Darkness::Vector3> probe;
+        for (uint32_t ci = 0; ci < wr.numCells; ++ci) {
+            const Darkness::WRParsedCell &cell = wr.cells[ci];
+            for (int pi = 0; pi < cell.numTextured; ++pi) {
+                if (pi >= static_cast<int>(cell.lightInfos.size())) break;
+                uint32_t flags = cell.lightInfos[pi].animflags;
+                int overlayIdx = 0;
+                while (flags) {
+                    const int bit = __builtin_ctz(flags);
+                    flags &= flags - 1;
+                    const int thisOverlay = overlayIdx++;
+                    const int16_t ln =
+                        (bit < static_cast<int>(cell.animMap.size()))
+                            ? cell.animMap[bit] : -1;
+                    auto &bc = bitCensus[ln];
+                    ++bc.bits;
+                    if (Darkness::shippedOverlayLumels(wr, ci, pi,
+                                                       thisOverlay, probe))
+                        ++bc.readable;
+                }
+            }
+        }
+    }
+
     int seen = 0;
     for (uint32_t ci = 0; ci < wr.numCells; ++ci) {
         Darkness::WRParsedCell &cell = wr.cells[ci];
@@ -1421,6 +1454,20 @@ static int runLightmapOverlaysVerb(const std::string &misPath, int stride) {
         std::printf("  fitted/disk bright ratio: p5=%.3f p50=%.3f p95=%.3f "
                     "(1.0 = table holds the overlay's brightness)\n",
                     pct(ratios, 0.05), pct(ratios, 0.50), pct(ratios, 0.95));
+
+    // The bits-vs-readable census (built above, stride-independent). Only
+    // lights with a deficit are printed — each is a light the runtime blend
+    // indexes but cannot actually change.
+    int deficitLights = 0;
+    for (const auto &[ln, bc] : bitCensus)
+        if (bc.readable < bc.bits) ++deficitLights;
+    std::printf("  animMap bit census: %zu lightnums referenced; %d with "
+                "UNREADABLE overlay data:\n",
+                bitCensus.size(), deficitLights);
+    for (const auto &[ln, bc] : bitCensus)
+        if (bc.readable < bc.bits)
+            std::printf("    lightnum %d: %d bits, %d readable overlays\n",
+                        ln, bc.bits, bc.readable);
     return 0;
 }
 

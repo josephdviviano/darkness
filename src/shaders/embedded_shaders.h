@@ -51,6 +51,9 @@
 #include "glsl/fs_smaa_weights.sc.bin.h"
 #include "glsl/vs_smaa_blend.sc.bin.h"
 #include "glsl/fs_smaa_blend.sc.bin.h"
+#include "glsl/vs_shadow_depth.sc.bin.h"
+#include "glsl/fs_shadow_depth.sc.bin.h"
+#include "glsl/fs_shadow_debug.sc.bin.h"
 
 // ESSL (OpenGL ES) — all platforms
 #include "essl/vs_basic.sc.bin.h"
@@ -81,6 +84,9 @@
 #include "essl/fs_smaa_weights.sc.bin.h"
 #include "essl/vs_smaa_blend.sc.bin.h"
 #include "essl/fs_smaa_blend.sc.bin.h"
+#include "essl/vs_shadow_depth.sc.bin.h"
+#include "essl/fs_shadow_depth.sc.bin.h"
+#include "essl/fs_shadow_debug.sc.bin.h"
 
 // SPIR-V (Vulkan) — all platforms
 #include "spirv/vs_basic.sc.bin.h"
@@ -111,6 +117,9 @@
 #include "spirv/fs_smaa_weights.sc.bin.h"
 #include "spirv/vs_smaa_blend.sc.bin.h"
 #include "spirv/fs_smaa_blend.sc.bin.h"
+#include "spirv/vs_shadow_depth.sc.bin.h"
+#include "spirv/fs_shadow_depth.sc.bin.h"
+#include "spirv/fs_shadow_debug.sc.bin.h"
 
 // Metal — macOS / iOS only
 #if BGFX_PLATFORM_SUPPORTS_METAL
@@ -142,6 +151,9 @@
 #include "metal/fs_smaa_weights.sc.bin.h"
 #include "metal/vs_smaa_blend.sc.bin.h"
 #include "metal/fs_smaa_blend.sc.bin.h"
+#include "metal/vs_shadow_depth.sc.bin.h"
+#include "metal/fs_shadow_depth.sc.bin.h"
+#include "metal/fs_shadow_debug.sc.bin.h"
 #endif
 
 // DXBC (Direct3D 11/12) — Windows only
@@ -174,6 +186,9 @@
 #include "dx11/fs_smaa_weights.sc.bin.h"
 #include "dx11/vs_smaa_blend.sc.bin.h"
 #include "dx11/fs_smaa_blend.sc.bin.h"
+#include "dx11/vs_shadow_depth.sc.bin.h"
+#include "dx11/fs_shadow_depth.sc.bin.h"
+#include "dx11/fs_shadow_debug.sc.bin.h"
 #endif
 
 // ── Embedded shader lookup table ──
@@ -208,5 +223,8 @@ static const bgfx::EmbeddedShader s_embeddedShaders[] = {
     BGFX_EMBEDDED_SHADER(fs_smaa_weights),
     BGFX_EMBEDDED_SHADER(vs_smaa_blend),
     BGFX_EMBEDDED_SHADER(fs_smaa_blend),
+    BGFX_EMBEDDED_SHADER(vs_shadow_depth),
+    BGFX_EMBEDDED_SHADER(fs_shadow_depth),
+    BGFX_EMBEDDED_SHADER(fs_shadow_debug),
     BGFX_EMBEDDED_SHADER_END()
 };

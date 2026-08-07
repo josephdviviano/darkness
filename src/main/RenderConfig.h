@@ -801,6 +801,26 @@ struct RenderConfig {
     // hard light borders — the falloff terminates on its own.
     bool  rebakeFalloffPhysical = true;
     float rebakeFalloffAnchor   = 8.0f;
+    // Throw-derived intensity: anchor each light at THIS fraction of its
+    // authored throw (explicit radius, else per-cell-list reach), clamped
+    // to [anchor, kThrowAnchorMax]. Recovers per-light intensity the 1/r
+    // authoring encoded as reach; 0 = single global anchor (the pre-throw
+    // physical look). Default set from the shipped-atlas luminance-ratio
+    // sweep (PLAN.HIGH_RES_SHADOWS falloff section).
+    float rebakeThrowAlpha      = 0.5f;
+    // S1 shadow-map oracle (PLAN.HIGH_RES_SHADOWS §S1). CLI-only like the
+    // rebake family — promotion to YAML waits for the knobs to stabilise
+    // (handoff §4.7). Face size is the per-face edge in texels; the
+    // cross-check renders a pool of lights at startup and compares N random
+    // (point, light) face lookups against raycastWorld (0 = don't run).
+    int shadowFaceSize        = 256;
+    int shadowCrossCheckPairs = 0;
+    // DEV-ONLY --stress-frob-obj "a,b": send FrobWorldEnd to exactly these
+    // object IDs every ~3 s (5 s warmup) through ScriptManager — the same
+    // message FrobSystem::executeFrob sends, so lever→ControlDevice→script
+    // chains run headlessly. Built to reproduce "switch 434 doesn't toggle
+    // the cathedral lights" without a mouse.
+    std::string stressFrobObjs;
     bool stepLog          = false;  // stair step diagnostics to stderr ([STEP] prefix)
     bool togglePlatforms  = false;  // auto-activate all moving terrain at startup
     bool noProbes         = false;  // skip probe baking (no spatial audio)
@@ -2630,6 +2650,19 @@ inline CliResult applyCliOverrides(int argc, char* argv[], RenderConfig& cfg) {
         } else if (std::strcmp(argv[i], "--rebake-falloff-anchor") == 0 && i + 1 < argc) {
             cfg.rebakeFalloffAnchor = std::min(32.0f, std::max(1.0f,
                 static_cast<float>(std::atof(argv[++i]))));
+        } else if (std::strcmp(argv[i], "--rebake-throw-alpha") == 0 && i + 1 < argc) {
+            cfg.rebakeThrowAlpha = std::min(1.0f, std::max(0.0f,
+                static_cast<float>(std::atof(argv[++i]))));
+        } else if (std::strcmp(argv[i], "--shadow-face-size") == 0 && i + 1 < argc) {
+            cfg.shadowFaceSize = std::min(2048, std::max(64,
+                std::atoi(argv[++i])));
+        } else if (std::strcmp(argv[i], "--shadow-crosscheck") == 0) {
+            // Optional pair-count argument: --shadow-crosscheck 50000
+            cfg.shadowCrossCheckPairs = 20000;
+            if (i + 1 < argc && argv[i + 1][0] != '-')
+                cfg.shadowCrossCheckPairs = std::max(100, std::atoi(argv[++i]));
+        } else if (std::strcmp(argv[i], "--stress-frob-obj") == 0 && i + 1 < argc) {
+            cfg.stressFrobObjs = argv[++i];
         } else if (std::strcmp(argv[i], "--skip-reflection-bake") == 0) {
             // Deprecated CLI flag — reflection bake is no longer
             // skippable; every probe-bake-needed path runs the full bake

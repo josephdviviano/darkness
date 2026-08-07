@@ -315,6 +315,30 @@ struct BakeFormula {
     // lists. Off for parity; the in-game bake enables it.
     bool  falloffPhysical  = false;
     float falloffAnchor    = 8.0f;
+    // ── Throw-derived intensity (see the helpers above physicalAnchors) ──
+    // alpha > 0 anchors each light at alpha × its authored throw (clamped
+    // to [falloffAnchor, kThrowAnchorMax]) instead of the single global
+    // anchor — recovering per-light intensity from the authored data. In
+    // throw mode the authored radius hard cut and soft tail are DISABLED
+    // (the radius is spent as intensity; the physical curve tapers below
+    // quantisation on its own). 0 = off (parity, and the pre-throw
+    // physical construction).
+    float throwAlpha       = 0.0f;
+    // The per-light anchor table, built by the bake driver via
+    // physicalAnchors() when throwAlpha > 0. NON-OWNING; nullptr = global
+    // anchor everywhere. Never hashed into the cache key — throwAlpha is
+    // the generative parameter.
+    const std::vector<float> *perLightAnchor = nullptr;
+
+    bool throwMode() const {
+        return falloffPhysical && throwAlpha > 0.0f && perLightAnchor;
+    }
+    float anchorFor(int lightIdx) const {
+        if (perLightAnchor && lightIdx >= 0 &&
+            lightIdx < static_cast<int>(perLightAnchor->size()))
+            return (*perLightAnchor)[lightIdx];
+        return falloffAnchor;
+    }
 };
 
 // Is the light visible from this surface point?
@@ -680,13 +704,98 @@ inline float physicalDistFactor(float len, float anchor, float emitterA) {
     return (anchor * anchor + a2) / (anchor * (len * len + a2));
 }
 
+// ── Throw-derived intensity (per-light anchors) ────────────────────────────
+//
+// The physical falloff SHAPE is right; what the global anchor got wrong is
+// per-light INTENSITY. Under the original's 1/r the designers stated each
+// light's intended reach — its THROW — twice: an authored radius on ~20% of
+// lights (2..80 units, clearly per-fixture), and the per-cell light lists
+// for the rest. A single global anchor pins every light to its original
+// brightness at one mission-wide distance (8u), which under inverse-square
+// leaves a radius-40 fixture at a FIFTH of its authored brightness at its
+// own edge. Light is gameplay (the lightgem reads these lumels), so that
+// discrepancy is not cosmetic.
+//
+// Anchoring each light at a FRACTION of its own throw is exactly
+// "modulate intensity by throw": scaling the curve and moving its
+// 1/r-equivalence point are the same operation. The authored hard cut is
+// NOT kept in throw mode — the radius has been spent as intensity, and the
+// physical curve tapers below quantisation on its own (smooth, borderless).
+
+// Upper bound on a throw-derived anchor: keeps s = K(anchor)/K(8) within
+// ~4x so the near field cannot blow the 8-bit store out arbitrarily far.
+constexpr float kThrowAnchorMax = 32.0f;
+
+// Per-light throw from the authored data: the explicit radius where one
+// was authored, else the reach of the per-cell light lists (the original's
+// actual reach mechanism) — farthest extent of any cell that lists the
+// light. Slot 0 (sun) and unlisted lights stay 0.
+inline std::vector<float> authoredThrow(const WRParsedData &wr) {
+    std::vector<float> throwR(wr.staticLights.size(), 0.0f);
+    for (const auto &cell : wr.cells) {
+        const auto &lt = cell.lightIndices;
+        const int n = lt.empty() ? 0 : static_cast<int>(lt[0]);
+        for (int k = 1; k <= n && k < static_cast<int>(lt.size()); ++k) {
+            const uint16_t li = lt[k];
+            if (li == 0 || li >= throwR.size()) continue;
+            const float d =
+                glm::length(cell.center - wr.staticLights[li].loc) +
+                cell.radius;
+            if (d > throwR[li]) throwR[li] = d;
+        }
+    }
+    for (size_t li = 1; li < wr.staticLights.size(); ++li)
+        if (wr.staticLights[li].radius > 0.0f)
+            throwR[li] = wr.staticLights[li].radius;
+    return throwR;
+}
+
+// anchor_i = clamp(sqrt(anchorDefault · 2·alpha·throw_i), anchorDefault,
+// kThrowAnchorMax) — the GEOMETRIC MEAN of the near-field floor and the
+// (alpha-scaled) throw. Measured reason (MISS2 sweep, 2026-08-07): a linear
+// alpha·throw law let big LIST-derived throws (outdoor lamps listing many
+// large cells) boost intensity ~4x and lift formerly-cut street shadows by
+// +63/255 at the tail. The sqrt law is self-limiting: doubling a light's
+// throw grows its anchor by √2, so the huge throws that inflate under the
+// list derivation stay tame while the mid-range (the actual darkness
+// problem) still recovers. At alpha=0.5 this is exactly √(anchor·throw).
+// The floor at the global default means no light ever gets DIMMER than the
+// uniform-anchor construction; small candles keep today's look exactly.
+inline std::vector<float> physicalAnchors(const WRParsedData &wr,
+                                          float alpha, float anchorDefault) {
+    std::vector<float> anchors(wr.staticLights.size(), anchorDefault);
+    if (alpha <= 0.0f) return anchors;
+    // List-derived throws (unbounded lights) carry HALF weight and a
+    // tighter cap. Measured (MISS2 A/B, 2026-08-07): an authored radius
+    // cuts light that is still bright — full intent, full law — while a
+    // list edge is where contribution became negligible; treating list
+    // reach as full intent lifted formerly-cut outdoor shadows +63/255 at
+    // the tail. Radius-only throws left the tail at +6/255 but lost the
+    // dark-end recovery; the asymmetric weighting keeps both.
+    constexpr float kListThrowWeight = 0.5f;
+    constexpr float kListAnchorMax   = 24.0f;
+    const std::vector<float> throwR = authoredThrow(wr);
+    for (size_t li = 1; li < anchors.size(); ++li) {
+        const bool authored = wr.staticLights[li].radius > 0.0f;
+        const float tw = authored ? throwR[li]
+                                  : throwR[li] * kListThrowWeight;
+        const float cap = authored ? kThrowAnchorMax : kListAnchorMax;
+        float a = std::sqrt(anchorDefault * 2.0f * alpha * tw);
+        if (a < anchorDefault) a = anchorDefault;
+        if (a > cap) a = cap;
+        anchors[li] = a;
+    }
+    return anchors;
+}
+
 // The sub-quantisation reach radius of a light under physical falloff: the
 // distance at which its peak possible contribution drops below half an
 // 8-bit count. Pure geometry — no cell lists, no authored reach. The
 // authored radius (where present) remains an upper bound: it is a designer
 // CONSTRAINT, not a rendering artefact.
 inline float physicalReachRadius(const WRStaticLight &L, float anchor,
-                                 float emitterA, float brightScale) {
+                                 float emitterA, float brightScale,
+                                 bool clampToAuthored = true) {
     const float peak =
         std::max({L.bright.x, L.bright.y, L.bright.z}) * brightScale;
     if (peak <= 0.0f) return 0.0f;
@@ -696,7 +805,9 @@ inline float physicalReachRadius(const WRStaticLight &L, float anchor,
     if (rq2 <= 0.0f) return 0.0f;
     float rq = std::sqrt(rq2);
     if (rq > kPhysicalReachCap) rq = kPhysicalReachCap;
-    if (L.radius > 0.0f && L.radius < rq) rq = L.radius;
+    // Throw mode passes false: the radius is spent as intensity there and
+    // the curve tapers on its own — clamping would re-cut the smooth tail.
+    if (clampToAuthored && L.radius > 0.0f && L.radius < rq) rq = L.radius;
     return rq;
 }
 
@@ -915,11 +1026,17 @@ struct LightSample {
 inline LightSample bakeOneLight(const WRStaticLight &L,
                                 const Vector3 &pos,
                                 const Vector3 &normal,
-                                const BakeFormula &f) {
+                                const BakeFormula &f,
+                                int lightIdx = -1) {
     LightSample out;
     const Vector3 toLight = L.loc - pos;
     const float cosTerm = glm::dot(toLight, normal);
     if (cosTerm < 0.0f) return out;
+
+    // Throw mode: the authored radius has been SPENT as intensity (see
+    // physicalAnchors) — no hard cut, no soft tail; the physical curve
+    // tapers below quantisation on its own.
+    const bool throwMode = f.throwMode();
 
     const float len = glm::length(toLight);
     if (len < 1e-6f) {
@@ -928,7 +1045,7 @@ inline LightSample bakeOneLight(const WRStaticLight &L,
                                     out.contribution.z});
         return out;
     }
-    if (L.radius > 0.0f && len > L.radius) return out;
+    if (!throwMode && L.radius > 0.0f && len > L.radius) return out;
 
     float scale = f.halfLambert ? (cosTerm / len * 0.5f + 0.5f)
                                 : (cosTerm / len);
@@ -937,7 +1054,7 @@ inline LightSample bakeOneLight(const WRStaticLight &L,
     // Soft tail on radius-limited lights (falloff naturalisation): the
     // recorded construction cuts to zero AT the radius, which reads as a
     // hard ring at re-bake resolution. Smoothstep over the last fraction.
-    if (f.softRadiusFrac > 0.0f && L.radius > 0.0f) {
+    if (!throwMode && f.softRadiusFrac > 0.0f && L.radius > 0.0f) {
         const float fadeStart = L.radius * (1.0f - f.softRadiusFrac);
         if (len > fadeStart) {
             float t = (L.radius - len) / (L.radius - fadeStart);
@@ -969,9 +1086,10 @@ inline LightSample bakeOneLight(const WRStaticLight &L,
     if (spot <= 0.0f) return out;
 
     // Distance response: the recorded engine's inverse-linear, or the
-    // physical finite-emitter inverse-square (see BakeFormula).
+    // physical finite-emitter inverse-square (see BakeFormula). The anchor
+    // is per-light under throw mode — that IS the intensity recovery.
     const float distFactor = f.falloffPhysical
-        ? physicalDistFactor(len, f.falloffAnchor, f.emitterRadius)
+        ? physicalDistFactor(len, f.anchorFor(lightIdx), f.emitterRadius)
         : (1.0f / len);
     const Vector3 preSpot = L.bright * (f.brightScale * scale * distFactor);
     out.preSpotPeak = std::max({preSpot.x, preSpot.y, preSpot.z});
@@ -1262,8 +1380,10 @@ inline bool bakePolygon(const WRParsedData &wr,
                 if (lightMask && !lightMask[lightIdx]) continue;
                 const WRStaticLight &L = wr.staticLights[lightIdx];
 
-                // Cheap rejection before the expensive part.
-                if (L.radius > 0.0f) {
+                // Cheap rejection before the expensive part. Not in throw
+                // mode — the radius is spent as intensity there and the
+                // sub-quantisation skip below bounds the cost instead.
+                if (!f.throwMode() && L.radius > 0.0f) {
                     const Vector3 d = p - L.loc;
                     if (glm::dot(d, d) > L.radius * L.radius) continue;
                 }
@@ -1273,7 +1393,8 @@ inline bool bakePolygon(const WRParsedData &wr,
                 // needs no ray at all (the original's per-polygon backface
                 // gate is this same test: dot(L−P, n) IS the light's plane
                 // distance for any P on the plane).
-                const LightSample sample = bakeOneLight(L, p, g.normal, f);
+                const LightSample sample =
+                    bakeOneLight(L, p, g.normal, f, lightIdx);
                 if (sample.preSpotPeak <= 0.0f) continue;
                 // Sub-quantisation skip: a contribution under half a 1/255
                 // count stores nothing in ANY storage mode, so its ray is
@@ -1734,6 +1855,14 @@ inline void bakeAtlasWithOverlays(const WRParsedData &wr,
     for (size_t i = 0; i < animated.size(); ++i)
         if (animated[i]) baseMask[i] = 0;
 
+    // Throw-derived per-light anchors (intensity recovery). Owned here —
+    // baseF/overlayF below carry non-owning pointers into it, and the
+    // vector outlives every worker thread this function spawns.
+    std::vector<float> throwAnchors;
+    const bool throwMode = f.falloffPhysical && f.throwAlpha > 0.0f;
+    if (throwMode)
+        throwAnchors = physicalAnchors(wr, f.throwAlpha, f.falloffAnchor);
+
     // Overlay bakes carry exactly one light: no ambient, no sun, hard
     // shadows kept identical to the base so the two layers sum coherently.
     BakeFormula overlayF = f;
@@ -1746,6 +1875,11 @@ inline void bakeAtlasWithOverlays(const WRParsedData &wr,
     // (ambient bouncing off every surface would double-count as fake GI).
     BakeFormula baseF = f;
     if (gather) baseF.includeAmbient = false;
+
+    if (throwMode) {
+        overlayF.perLightAnchor = &throwAnchors;
+        baseF.perLightAnchor    = &throwAnchors;
+    }
 
     static const AlbedoTable kGreyAlbedo;
     const AlbedoTable &alb = albedo ? *albedo : kGreyAlbedo;
@@ -1761,8 +1895,10 @@ inline void bakeAtlasWithOverlays(const WRParsedData &wr,
         for (size_t li = 1; li < wr.staticLights.size(); ++li)
             if (lightCells[li] >= 0)   // outside the world: casts nothing
                 reachRadii[li] = physicalReachRadius(
-                    wr.staticLights[li], f.falloffAnchor, f.emitterRadius,
-                    f.brightScale);
+                    wr.staticLights[li],
+                    throwMode ? throwAnchors[li] : f.falloffAnchor,
+                    f.emitterRadius, f.brightScale,
+                    /*clampToAuthored=*/!throwMode);
     } else if (f.reachExpand > 0) {
         expandedLists = expandCellLightLists(wr, f.reachExpand);
     }
