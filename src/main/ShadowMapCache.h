@@ -187,6 +187,13 @@ struct ShadowMapCache {
     uint32_t facesRendered = 0;
     uint32_t facesCulled   = 0;
     uint32_t lightRenders  = 0;
+    // Slot EVICTIONS: an occupied slot repurposed for a different light.
+    // The pool is shared by baked-light promotions (2 pinned slots each),
+    // live emitters and transients, so a single door swing can pin 40+ of
+    // 66 and push everything else into LRU thrash — which reads on screen
+    // as lights UNRELATED to the door changing while it moves.
+    uint32_t slotEvictions = 0;
+    uint32_t slotsPinned   = 0;   // sampled each census
 
     bool valid() const { return bgfx::isValid(fb); }
 };
@@ -721,6 +728,8 @@ inline int ensureShadowLight(ShadowMapCache &c, const WRParsedData &wr,
     if (freeSlot < 0 && lruAge == 0xffffffffu) return -1;  // all pinned
 
     const int slot = freeSlot >= 0 ? freeSlot : lruSlot;
+    if (freeSlot < 0 && slot >= 0 && c.slots[slot].rendered)
+        ++c.slotEvictions;     // took a live slot from another light
     renderShadowFaces(c, wr, lightIdx, slot, frameIndex);
     return slot;
 }
@@ -730,17 +739,38 @@ inline int ensureShadowLight(ShadowMapCache &c, const WRParsedData &wr,
 // ids so they can never collide with static-table indices. A moving
 // light re-renders every frame (pos changes); a parked one goes valid
 // like any other slot.
+// `forceRender` skips the validity check entirely.
+//
+// The check asks whether the caster set moved, via shadowDynamicCasterHash
+// — which mixes a dynamic body in only when it is within the light's reach,
+// tested against `b.worldPos`. For a ROTATING door that origin barely moves
+// while the leaf sweeps around it, so the hash can stay constant across an
+// entire swing: the faces keep whatever door pose they last rendered, the
+// light reports "still valid", and its shadow only catches up when some
+// unrelated change forces a re-render. Measured on MISS6 door 407: with the
+// leaf MOVING, all 21 promoted lights were skipping their re-render, each
+// catching up on a different frame — the per-light flicker reported from
+// the game 2026-08-08.
+//
+// A promoted light is by definition coupled to a moving leaf, so its
+// current-pose faces are unconditionally stale. Callers on that path pass
+// forceRender and get a synchronous refresh every frame. Fixing the hash
+// instead was rejected: a validity heuristic that is right for translation
+// and wrong for rotation is exactly the kind of thing that rots silently,
+// and the S4c contract is that every promoted shadow is current EVERY
+// frame.
 inline int ensureDynamicShadowLight(ShadowMapCache &c,
                                     const WRParsedData &wr, int id,
                                     const Vector3 &pos, float reach,
-                                    uint32_t frameIndex) {
+                                    uint32_t frameIndex,
+                                    bool forceRender = false) {
     if (!c.valid() || id >= 0 || reach <= 0.0f) return -1;
     int freeSlot = -1, lruSlot = 0;
     uint32_t lruAge = 0xffffffffu;
     for (int i = 0; i < c.slotCount; ++i) {
         ShadowSlot &s = c.slots[i];
         if (s.lightIdx == id) {
-            const bool valid = s.rendered && s.pos == pos &&
+            const bool valid = !forceRender && s.rendered && s.pos == pos &&
                                s.reach == reach &&
                                s.casterHash ==
                                    shadowDynamicCasterHash(c, pos, reach);
@@ -805,6 +835,8 @@ inline int acquireFrozenShadowSlot(ShadowMapCache &c, const WRParsedData &wr,
     const int slot = existing >= 0 ? existing
                    : freeSlot >= 0 ? freeSlot : lruSlot;
     if (slot < 0) return -1;   // pool entirely pinned
+    if (existing < 0 && freeSlot < 0 && c.slots[slot].lightIdx != 0)
+        ++c.slotEvictions;     // took a live slot from another light
     renderShadowFacesAt(c, wr, pos, reach, slot, &poseOv);
     ShadowSlot &s = c.slots[slot];
     s.lightIdx = id;

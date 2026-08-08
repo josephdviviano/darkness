@@ -1151,6 +1151,9 @@ static bool createGPUResources(const Darkness::MissionData &mission,
     gpu.u_liveLightPos      = bgfx::createUniform(
         "u_liveLightPos",      bgfx::UniformType::Vec4,
         Darkness::kLiveLightCap);
+    gpu.u_liveLightSpot     = bgfx::createUniform(
+        "u_liveLightSpot",     bgfx::UniformType::Vec4,
+        Darkness::kLiveLightCap);
     gpu.u_liveLightColor    = bgfx::createUniform(
         "u_liveLightColor",    bgfx::UniformType::Vec4,
         Darkness::kLiveLightCap);
@@ -1472,6 +1475,32 @@ static bool createGPUResources(const Darkness::MissionData &mission,
                                 / bs.lumelsGathered / 1e6,
                             100.0 * bs.gatherSky / bs.gatherRays,
                             100.0 * bs.gatherUnproven / bs.gatherRays);
+                    // Percentiles of the same quantity. A door opening into
+                    // a dark room is largely a BOUNCE effect, so whether
+                    // dynamic GI is worth building here depends on this
+                    // tail, not on the mean.
+                    {
+                        uint64_t tot = 0;
+                        for (int b = 0; b < 64; ++b) tot += bs.bounceHist[b];
+                        auto pctl = [&](double q) {
+                            uint64_t want = static_cast<uint64_t>(q * tot);
+                            uint64_t acc = 0;
+                            for (int b = 0; b < 64; ++b) {
+                                acc += bs.bounceHist[b];
+                                if (acc >= want) return b;
+                            }
+                            return 63;
+                        };
+                        uint64_t atZero = tot ? bs.bounceHist[0] : 0;
+                        std::fprintf(stderr,
+                            "Re-baked lightmaps: bounce distribution — "
+                            "%.1f%% of gathered lumels get < 1/255, "
+                            "p50 %d/255, p90 %d, p99 %d (64+ saturates). "
+                            "The ambient floor for comparison is ~13/255.\n",
+                            tot ? 100.0 * atZero / tot : 0.0,
+                            pctl(0.50), pctl(0.90), pctl(0.99));
+                    }
+
                     if (Darkness::writeLightmapBakeCache(cachePath, ckey, ours,
                                                          animPolys, &dirAtlas))
                         std::fprintf(stderr,
@@ -2420,6 +2449,7 @@ static void destroyGPUResources(Darkness::GPUResources &gpu)
     bgfx::destroy(gpu.u_liveFalloff);
     bgfx::destroy(gpu.u_liveLightPos);
     bgfx::destroy(gpu.u_liveLightColor);
+    bgfx::destroy(gpu.u_liveLightSpot);
     bgfx::destroy(gpu.u_liveShadowInfo);
     bgfx::destroy(gpu.s_liveShadowAtlas);
     bgfx::destroy(gpu.u_objectAmbient);

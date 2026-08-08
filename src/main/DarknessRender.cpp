@@ -828,10 +828,18 @@ static void renderWorld(
                     bgfx::setUniform(gpu.u_liveLightCount, liveCount);
                     if (liveN > 0) {
                         const float a = 0.75f;   // bake emitter radius
-                        const float liveFall[4] = { a * a, 0, 0, 0 };
+                        // .y = the PCSS emitter size. It used to be 0 here,
+                        // which degenerates the shadow lookup to a hard
+                        // 1-tap — fine for a live emitter that cancels
+                        // nothing, wrong for an S4c differential whose
+                        // frozen end must cancel a SOFT 16-sample baked
+                        // overlay. Same value the offscreen bake uses, so
+                        // the two ends agree by construction.
+                        const float liveFall[4] = { a * a, a, 0, 0 };
                         bgfx::setUniform(gpu.u_liveFalloff, liveFall);
                         float lp[Darkness::kLiveLightCap][4];
                         float lc[Darkness::kLiveLightCap][4];
+                        float ls[Darkness::kLiveLightCap][4];
                         for (int i = 0; i < liveN; ++i) {
                             const auto &L = state.liveLights[i];
                             lp[i][0] = L.pos.x; lp[i][1] = L.pos.y;
@@ -846,7 +854,18 @@ static void renderWorld(
                                 ? Darkness::packLiveDiffSlots(
                                       L.shadowSlotFrozen, L.shadowSlot)
                                 : static_cast<float>(L.shadowSlot);
+                            // Cone axis scaled by (inner*0.5+0.5) so one
+                            // vec4 carries dir + inner; w = outer. A zero
+                            // xyz is the omni sentinel, which is what
+                            // inner == -1 produces naturally.
+                            const float lenScale = L.spotInner * 0.5f + 0.5f;
+                            ls[i][0] = L.spotDir.x * lenScale;
+                            ls[i][1] = L.spotDir.y * lenScale;
+                            ls[i][2] = L.spotDir.z * lenScale;
+                            ls[i][3] = L.spotOuter;
                         }
+                        bgfx::setUniform(gpu.u_liveLightSpot, ls,
+                                         static_cast<uint16_t>(liveN));
                         bgfx::setUniform(gpu.u_liveLightPos, lp,
                                          static_cast<uint16_t>(liveN));
                         bgfx::setUniform(gpu.u_liveLightColor, lc,
@@ -8088,6 +8107,7 @@ int main(int argc, char *argv[]) {
         // S4c artifact harness: --door-diff-diag <objID> compares the
         // mid-swing differential result against the settled CPU truth
         // for one door and writes panel images (see DoorShadowSystem).
+        if (cfg.diagConeProbe) doorShadow.armConeProbe();
         if (cfg.doorDiffDiag != 0)
             doorShadow.runDiffDiagnostic(gpu.shadowCache,
                                          cfg.doorDiffDiag,
@@ -9044,12 +9064,14 @@ int main(int argc, char *argv[]) {
             if (state.useRebakedLightmaps &&
                 !gpu.rebakedAtlasHandles.empty()) {
                 for (const auto &pl : doorShadow.promotedLive()) {
-                    if (!lightTouchesVisible(
+                    if (!cfg.diagOpenLiveGates &&
+                        !lightTouchesVisible(
                             pl.pos, std::sqrt(std::max(pl.reach2, 0.0f)))) {
                         ++liveCulled;
                         continue;
                     }
-                    if (static_cast<int>(state.liveLights.size()) >=
+                    if (!cfg.diagOpenLiveGates &&
+                        static_cast<int>(state.liveLights.size()) >=
                         Darkness::kLiveLightCap) {
                         // No silent caps: a truncated promotion means a
                         // visibly lagged shadow — say so.
@@ -9073,6 +9095,9 @@ int main(int argc, char *argv[]) {
                     ll.colorK = pl.colorK;
                     ll.shadowSlot = pl.slotCurrent;
                     ll.shadowSlotFrozen = pl.slotFrozen;
+                    ll.spotDir = pl.spotDir;
+                    ll.spotInner = pl.spotInner;
+                    ll.spotOuter = pl.spotOuter;
                     state.liveLights.push_back(ll);
                 }
             }
@@ -9125,6 +9150,113 @@ int main(int argc, char *argv[]) {
                             "%zu, visible cells %zu\n",
                             dynBefore, state.dynamicLights.count(),
                             liveCulled, fc.visibleCells.size());
+                    }
+                }
+                // ── [LIGHT_DENSITY] the go/no-go number for per-pixel
+                // direct lighting ────────────────────────────────────────
+                //
+                // Fires once. For surface points across the CURRENTLY
+                // VISIBLE cells, counts how many static lights contribute
+                // above the storage quantisation (the same 0.5/255 test the
+                // bake uses to skip a ray), then re-counts with occlusion.
+                //
+                // The bake's ~23 reaching lights/polygon is a candidate
+                // count over a whole polygon with no occlusion — an upper
+                // bound. What decides affordability is how many survive at
+                // a POINT, occluded, which is this.
+                if (cfg.diagLightDensity) {
+                    static bool fired = false;
+                    if (!fired && !fc.visibleCells.empty() &&
+                        !gpu.shadowCache.lightReach.empty()) {
+                        fired = true;
+                        const auto &wr = mission.wrData;
+                        const auto &sc = gpu.shadowCache;
+                        std::vector<int> reachN, litN;
+                        size_t rayed = 0;
+                        int stride = 0;
+                        for (uint32_t ci : fc.visibleCells) {
+                            if (ci >= wr.numCells) continue;
+                            const auto &cell = wr.cells[ci];
+                            for (int pi = 0; pi < cell.numTextured; ++pi) {
+                                const Darkness::LumelGrid g =
+                                    Darkness::buildLumelGrid(wr, ci, pi, 1);
+                                if (!g.valid) continue;
+                                for (int y = 0; y < g.ly;
+                                     y += std::max(1, g.ly / 2))
+                                for (int x = 0; x < g.lx;
+                                     x += std::max(1, g.lx / 2)) {
+                                    const Darkness::Vector3 P =
+                                        g.at(x, y) + g.normal * 0.025f;
+                                    int nReach = 0, nLit = 0;
+                                    const bool doRays = ((stride++ % 7) == 0);
+                                    for (size_t li = 1;
+                                         li < wr.staticLights.size(); ++li) {
+                                        if (li >= sc.lightReach.size()) break;
+                                        const float reach = sc.lightReach[li];
+                                        if (reach <= 0.0f) continue;
+                                        const auto &L = wr.staticLights[li];
+                                        const Darkness::Vector3 toL = L.loc - P;
+                                        const float len = glm::length(toL);
+                                        if (len > reach) continue;
+                                        const float cosT =
+                                            glm::dot(g.normal, toL) / len;
+                                        if (cosT <= 0.0f) continue;
+                                        const float anchor2 =
+                                            li < sc.lightAnchor.size()
+                                                ? sc.lightAnchor[li] : 8.0f;
+                                        const float f =
+                                            Darkness::physicalDistFactor(
+                                                len, anchor2, 0.75f);
+                                        const float peak = std::max({
+                                            L.bright.x, L.bright.y,
+                                            L.bright.z}) *
+                                            (cosT * 0.5f + 0.5f) * f;
+                                        // Same sub-quantisation test the
+                                        // bake uses to decide a ray is worth
+                                        // casting at all.
+                                        if (peak * 255.0f < 0.5f) continue;
+                                        ++nReach;
+                                        if (doRays) {
+                                            Darkness::RayHit hit;
+                                            if (!Darkness::raycastWorld(
+                                                    wr, L.loc, P, hit))
+                                                ++nLit;
+                                        }
+                                    }
+                                    reachN.push_back(nReach);
+                                    if (doRays) { litN.push_back(nLit); ++rayed; }
+                                }
+                            }
+                        }
+                        auto pct = [](std::vector<int> &v, double q) {
+                            if (v.empty()) return 0;
+                            std::sort(v.begin(), v.end());
+                            size_t i = static_cast<size_t>(q * (v.size() - 1));
+                            return v[i];
+                        };
+                        auto mean = [](const std::vector<int> &v) {
+                            if (v.empty()) return 0.0;
+                            double s2 = 0.0;
+                            for (int x : v) s2 += x;
+                            return s2 / v.size();
+                        };
+                        const double mReach = mean(reachN), mLit = mean(litN);
+                        std::fprintf(stderr,
+                            "[LIGHT_DENSITY] %zu visible cells, %zu surface "
+                            "points (%zu ray-tested): lights contributing "
+                            "above quantisation per point — REACHING mean "
+                            "%.1f p50 %d p90 %d p99 %d max %d | UNOCCLUDED "
+                            "mean %.1f p50 %d p90 %d p99 %d max %d\n",
+                            fc.visibleCells.size(), reachN.size(), rayed,
+                            mReach, pct(reachN, 0.50), pct(reachN, 0.90),
+                            pct(reachN, 0.99), reachN.empty() ? 0
+                                : reachN.back(),
+                            mLit, pct(litN, 0.50), pct(litN, 0.90),
+                            pct(litN, 0.99), litN.empty() ? 0 : litN.back());
+                    }
+                }
+                if (false) {
+                    {
                     }
                 }
                 // Report the count once. This producer existed for months
@@ -9345,6 +9477,7 @@ int main(int argc, char *argv[]) {
             // rate-limited, so a still scene stays silent.
             {
                 static uint32_t prevRenders = 0;
+                static uint32_t prevEvictions = 0;
                 static uint32_t peakPerFrame = 0;
                 static uint64_t sumRenders = 0;
                 static double   accMs = 0.0;
@@ -9371,15 +9504,22 @@ int main(int argc, char *argv[]) {
                         >= 1.0f) {
                     lastReport = nowT;
                     const uint32_t tris = gpu.shadowCache.casterIndexCount / 3;
+                    uint32_t pinned = 0, occupied = 0;
+                    for (const auto &sl : gpu.shadowCache.slots) {
+                        if (sl.pinned) ++pinned;
+                        if (sl.rendered) ++occupied;
+                    }
+                    const uint32_t evicted =
+                        gpu.shadowCache.slotEvictions - prevEvictions;
+                    prevEvictions = gpu.shadowCache.slotEvictions;
                     std::fprintf(stderr,
                         "[SHADOW_LOAD] %.1f mean / %u peak light "
-                        "re-renders/frame "
-                        "(x6 faces; full-mesh upper bound %u tris/face = "
-                        "%.2fM tris in one frame, before per-cell range "
-                        "culling); frame time mean %.1f ms over %u frames\n",
+                        "re-renders/frame (x6 faces, %u tris/face); "
+                        "pool %u/%d occupied, %u PINNED, %u evictions; "
+                        "frame time mean %.1f ms over %u frames\n",
                         accFrames ? double(sumRenders) / accFrames : 0.0,
                         peakPerFrame, tris,
-                        peakPerFrame * 6.0 * tris / 1e6,
+                        occupied, gpu.shadowCache.slotCount, pinned, evicted,
                         accFrames ? accMs / accFrames : 0.0, accFrames);
                     peakPerFrame = 0;
                     sumRenders = 0;

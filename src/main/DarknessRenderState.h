@@ -324,6 +324,7 @@ struct GPUResources {
     bgfx::UniformHandle u_liveFalloff    = BGFX_INVALID_HANDLE;
     bgfx::UniformHandle u_liveLightPos   = BGFX_INVALID_HANDLE; // vec4 x cap
     bgfx::UniformHandle u_liveLightColor = BGFX_INVALID_HANDLE; // vec4 x cap
+    bgfx::UniformHandle u_liveLightSpot  = BGFX_INVALID_HANDLE; // vec4 x cap
     bgfx::UniformHandle u_liveShadowInfo = BGFX_INVALID_HANDLE;
     bgfx::UniformHandle s_liveShadowAtlas = BGFX_INVALID_HANDLE;
 };
@@ -341,6 +342,13 @@ struct LiveLight {
     float   reach2 = 0.0f;   // cutoff; sub-quantisation at the edge
     Vector3 colorK{0.0f};
     int     shadowSlot = -1; // S1 pool slot (-1 = unshadowed)
+    // Spot cone, mirroring WRStaticLight: inner == -1 is the omni
+    // sentinel. Promoted door lights include spots, and without this the
+    // differential was applied over the whole reach sphere while the
+    // baked overlay it corrects only exists inside the cone.
+    Vector3 spotDir{0.0f};
+    float   spotInner = -1.0f;
+    float   spotOuter = 0.0f;
     // S4c: >= 0 makes this a DIFFERENTIAL light — the shader term is
     // shadow(shadowSlot) − shadow(shadowSlotFrozen), the signed
     // correction for a baked light whose door is mid-swing. Differential
@@ -417,11 +425,16 @@ constexpr uint32_t kUniformCostObjectScalarDraw =
 // World draw (lightmapped / textured / flat): vs = u_modelView +
 // u_modelViewProj (128); fs ≤ u_fogColor + u_fogParams + u_lmAtlasSize +
 // u_lightmapScale + u_specParams + u_camPosWorld (96) + S4 live lights
-// (u_liveLightCount + u_liveFalloff + 2 arrays × kLiveLightCap = 160).
+// (u_liveLightCount + u_liveFalloff + THREE arrays × kLiveLightCap).
+// The arrays are u_liveLightPos, u_liveLightColor and u_liveLightSpot —
+// the third arrived with promoted-spot cone support and this model was not
+// updated with it, which under-counted every world draw by 512 bytes. The
+// budget DROPS OBJECT DRAWS when it is exceeded, so an under-count spends
+// headroom that was never measured.
 constexpr uint32_t kUniformCostWorldDraw =
     uniformAlignUp(128u) +
     uniformAlignUp(96u + 32u +
-                   2u * static_cast<uint32_t>(kLiveLightCap) * 16u);
+                   3u * static_cast<uint32_t>(kLiveLightCap) * 16u);
 
 // Water draw: vs = u_modelView + u_modelViewProj + u_waterParams +
 // u_waterFlow (160); fs = u_waterParams + u_fogColor + u_fogParams (48).

@@ -500,7 +500,19 @@ public:
         float   reach2 = 0.0f;
         int     slotFrozen = -1;
         int     slotCurrent = -1;
+        // Cone, straight off WRStaticLight (inner == -1 = omni). The
+        // differential MUST respect it: the baked overlay it corrects only
+        // exists inside the cone, so applying the correction over the whole
+        // reach sphere adds or removes light that was never baked.
+        Vector3 spotDir{0.0f};
+        float   spotInner = -1.0f;
+        float   spotOuter = 0.0f;
     };
+    // Arm the out-of-cone probe (--diag-cone-probe). Fires once, on the
+    // first frame that has live promotions — i.e. mid-swing, which is the
+    // only time the differential is applied at all.
+    void armConeProbe() { mConeProbeArmed = true; }
+
     const std::vector<PromotedLive> &promotedLive() const {
         return mPromotedLive;
     }
@@ -729,6 +741,15 @@ public:
             // exactly when the door pose changed (caster hash); the
             // frozen slot only gets its LRU stamp.
             mPromotedLive.clear();
+            size_t droppedThisFrame = 0, skippedRefresh = 0;
+            // Only meaningful while a leaf is actually moving: with every
+            // door at rest the caster hash SHOULD be unchanged and skipping
+            // the re-render is correct. Logging both cases together made a
+            // still frame look like a fault.
+            bool anyDoorMoving = false;
+            for (const auto &lm : mLastMotion)
+                if (std::chrono::duration<float>(now - lm.second).count()
+                        < kSettleSec) { anyDoorMoving = true; break; }
             for (PromotedLight &p : mPromoted) {
                 const size_t li = static_cast<size_t>(p.lightIdx);
                 if (li >= mWr->staticLights.size() ||
@@ -736,10 +757,25 @@ public:
                 const WRStaticLight &L = mWr->staticLights[li];
                 const float reach = mReach[li];
                 if (reach <= 0.0f) continue;
+                const uint32_t rendersBefore = sc->lightRenders;
+                // forceRender: a promoted light's leaf is moving, so its
+                // current-pose faces are stale every frame by definition.
                 p.slotCurrent = ensureDynamicShadowLight(
-                    *sc, *mWr, p.dynId, L.loc, reach, bgfxFrame);
+                    *sc, *mWr, p.dynId, L.loc, reach, bgfxFrame,
+                    /*forceRender=*/true);
                 touchShadowSlot(*sc, p.slotFrozen, bgfxFrame);
-                if (p.slotFrozen < 0 || p.slotCurrent < 0) continue;
+                if (sc->lightRenders == rendersBefore) ++skippedRefresh;
+                // NO SILENT DROP. A promoted light that loses either slot
+                // vanishes from mPromotedLive for this frame, its
+                // differential disappears, and the pixel falls back to the
+                // BAKED shadow at the frozen pose — i.e. the door snaps to
+                // where it used to be, for one frame, then snaps back. That
+                // reads on screen as per-light flicker, and it used to
+                // happen without a word.
+                if (p.slotFrozen < 0 || p.slotCurrent < 0) {
+                    ++droppedThisFrame;
+                    continue;
+                }
                 PromotedLive pl;
                 pl.pos = L.loc;
                 pl.colorK = L.bright *
@@ -747,8 +783,32 @@ public:
                 pl.reach2 = reach * reach;
                 pl.slotFrozen = p.slotFrozen;
                 pl.slotCurrent = p.slotCurrent;
+                pl.spotDir = L.dir;
+                pl.spotInner = L.inner;
+                pl.spotOuter = L.outer;
                 mPromotedLive.push_back(pl);
             }
+            // The user's hypothesis, made measurable: are all promoted
+            // lights refreshed every frame, and does any of them drop?
+            // Both must be answerable without guessing at a screenshot.
+            if (anyDoorMoving && (droppedThisFrame || skippedRefresh)) {
+                const auto nowL = std::chrono::steady_clock::now();
+                if (std::chrono::duration<float>(nowL - mLastLiveLog)
+                        .count() >= 1.0f) {
+                    mLastLiveLog = nowL;
+                    std::fprintf(stderr,
+                        "[LIVE_REFRESH] door MOVING, %zu promoted light(s): "
+                        "%zu DROPPED this frame (no slot -> differential "
+                        "gone -> baked frozen pose shows through), %zu NOT "
+                        "re-rendered (caster hash unchanged — the light's "
+                        "reach does not contain the moving leaf)\n",
+                        mPromoted.size(), droppedThisFrame, skippedRefresh);
+                }
+            }
+        }
+        if (mConeProbeArmed && !mPromotedLive.empty() && sc) {
+            mConeProbeArmed = false;   // once per arming
+            probeOutOfCone(*sc);
         }
 
         // Immediate rebuild when idle (kills the first-frame lag the user
@@ -2434,6 +2494,133 @@ private:
         mDirPending.push_back(recIdx);   // released at event drain
     }
 
+    // ── Out-of-cone differential probe (diagnostic) ─────────────────────
+    //
+    // The differential is applied PER LIGHT, to every pixel inside that
+    // light's reach (liveLightSum has no cone gate). The bake decomposes
+    // PER (poly, light), giving a light an overlay only on polygons inside
+    // the door's shadow cone. Those two scopes do not match, and on every
+    // polygon in the gap the shader adds
+    //     colorK * falloff * cos * (V_current - V_frozen)
+    // on top of a base that was never decomposed for that light. That term
+    // MUST be identically zero out there. Nothing enforces it, and no
+    // existing harness samples it: --door-diff-diag sweeps mDoorWork, which
+    // IS the cone set.
+    //
+    // So this walks the gap and measures it, in the same units the artifact
+    // would be seen in (/255 of stored radiance), using the shader's exact
+    // hard test and bias so a disagreement here is a real disagreement.
+    void probeOutOfCone(ShadowMapCache &sc) {
+        if (mPromotedLive.empty() || !mWr) return;
+        std::vector<float> atlas;
+        if (!readShadowAtlasBlocking(sc, atlas)) {
+            std::fprintf(stderr,
+                "[CONE_PROBE] shadow atlas readback failed — no measurement\n");
+            return;
+        }
+        // Cone set: exactly the (poly, light) pairs the bake decomposed.
+        std::unordered_set<uint64_t> cone;
+        for (const auto &dw : mDoorWork)
+            for (const auto &pr : dw.second)
+                cone.insert((static_cast<uint64_t>(pr.first) << 16) |
+                            static_cast<uint16_t>(pr.second));
+
+        const float a2 = mFormula.emitterRadius * mFormula.emitterRadius;
+        size_t sampled = 0, nonZero = 0;
+        double sumAbs = 0.0, maxAbs = 0.0;
+        int worstCell = -1, worstPoly = -1, worstLight = -1;
+
+        for (const auto &pl : mPromotedLive) {
+            if (pl.slotFrozen < 0 || pl.slotCurrent < 0) continue;
+            const float reach = std::sqrt(std::max(pl.reach2, 0.0f));
+            if (reach <= 0.0f) continue;
+            // Which static light is this? colorK/pos identify it well
+            // enough for the census; the pair key needs the index.
+            int16_t li = -1;
+            for (const auto &pp : mPromoted)
+                if (glm::length(mWr->staticLights[
+                        static_cast<size_t>(pp.lightIdx)].loc - pl.pos)
+                    < 1e-3f) { li = pp.lightIdx; break; }
+            if (li < 0) continue;
+
+            for (uint32_t ci = 0; ci < mWr->numCells; ++ci) {
+                const WRParsedCell &cell = mWr->cells[ci];
+                if (glm::length(cell.center - pl.pos) - cell.radius > reach)
+                    continue;
+                for (int pi = 0; pi < cell.numTextured; ++pi) {
+                    const uint64_t key =
+                        (static_cast<uint64_t>((ci << 8) | (pi & 0xFF)) << 16)
+                        | static_cast<uint16_t>(li);
+                    // mDoorWork keys are (recIdx<<16)|light, not (ci,pi) —
+                    // so match on the rec instead: a poly with an overlay
+                    // for this light IS in the cone.
+                    (void)key;
+                    bool inCone = false;
+                    if (mAnimPolys)
+                        for (const auto &rec : *mAnimPolys) {
+                            if (rec.ci != ci || rec.pi != pi) continue;
+                            for (int16_t o : rec.overlayLightIdx)
+                                if (o == li) { inCone = true; break; }
+                            break;
+                        }
+                    if (inCone) continue;          // decomposed: not the gap
+
+                    const LumelGrid g = buildLumelGrid(*mWr, ci, pi, 1);
+                    if (!g.valid) continue;
+                    // A few lumels per poly — this is a census, not a bake.
+                    for (int sy = 0; sy < g.ly; sy += std::max(1, g.ly / 3))
+                    for (int sx = 0; sx < g.lx; sx += std::max(1, g.lx / 3)) {
+                        const Vector3 P = g.at(sx, sy) +
+                                          g.normal * mFormula.surfaceOffset;
+                        const Vector3 toL = pl.pos - P;
+                        const float d2 = glm::dot(toL, toL);
+                        if (d2 > pl.reach2) continue;
+                        const float dist = std::sqrt(std::max(d2, 1e-6f));
+                        const float cosT = glm::dot(g.normal, toL) / dist;
+                        if (cosT <= 0.0f) continue;   // shader culls first
+                        auto vis = [&](int slot) -> float {
+                            const float stored = shadowAtlasSampleCPU(
+                                sc, atlas, slot, pl.pos, P);
+                            if (stored < 0.0f) return 1.0f;
+                            return dist / reach <= stored + 0.5f / reach
+                                       ? 1.0f : 0.0f;
+                        };
+                        const float dv = vis(pl.slotCurrent)
+                                       - vis(pl.slotFrozen);
+                        ++sampled;
+                        if (dv == 0.0f) continue;
+                        ++nonZero;
+                        // What the shader would ADD here, in /255.
+                        const float halfLam = cosT * 0.5f + 0.5f;
+                        const float fall = 1.0f / (d2 + a2);
+                        const float peak = std::max({pl.colorK.x, pl.colorK.y,
+                                                     pl.colorK.z});
+                        const float radiance =
+                            std::abs(peak * halfLam * fall * dv) * 255.0f;
+                        sumAbs += radiance;
+                        if (radiance > maxAbs) {
+                            maxAbs = radiance;
+                            worstCell = static_cast<int>(ci);
+                            worstPoly = pi;
+                            worstLight = li;
+                        }
+                    }
+                }
+            }
+        }
+        std::fprintf(stderr,
+            "[CONE_PROBE] %zu promoted light(s): %zu samples OUTSIDE the "
+            "door cone, %zu with a NON-ZERO differential (%.2f%%); "
+            "mean |delta| %.2f/255, max %.1f/255 (cell %d poly %d light %d). "
+            "Every one of these is the differential writing onto baked "
+            "lighting the bake never decomposed for that light — expected "
+            "count is ZERO.\n",
+            mPromotedLive.size(), sampled, nonZero,
+            sampled ? 100.0 * double(nonZero) / double(sampled) : 0.0,
+            nonZero ? sumAbs / double(nonZero) : 0.0, maxAbs,
+            worstCell, worstPoly, worstLight);
+    }
+
     // ── S4c promotion machinery ─────────────────────────────────────────
     // One baked light rendered differentially while a door swings
     // through its cone. frozenId's faces hold the door at the
@@ -2656,6 +2843,8 @@ private:
     std::unordered_set<int32_t> mEventDoors;
     std::chrono::steady_clock::time_point mLastPromoteLog{};
     bool mPoseSnapInit = false;
+    bool mConeProbeArmed = false;
+    std::chrono::steady_clock::time_point mLastLiveLog{};
     std::unordered_map<int32_t, std::vector<std::pair<size_t, int16_t>>>
         mDoorWork;
     std::unordered_map<int32_t,

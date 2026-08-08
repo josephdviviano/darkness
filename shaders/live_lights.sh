@@ -40,6 +40,9 @@ uniform vec4 u_liveLightPos[LIVE_LIGHT_CAP];
 // the two poses agree. The baked overlay stays untouched during the
 // swing; this term is the (signed) correction on top of it.
 uniform vec4 u_liveLightColor[LIVE_LIGHT_CAP];
+// xyz = cone axis * (inner*0.5+0.5), w = outer cosine;
+// zero xyz = omni. See liveSpotFactor.
+uniform vec4 u_liveLightSpot[LIVE_LIGHT_CAP];
 // S1 face atlas geometry: .x = tilesPerRow, .y = faceSize/atlasW,
 // .z = faceSize/atlasH, .w = 1 when the backend's render-target memory is
 // bottom-up (GL) — the CPU readback lookup applies the same flip.
@@ -267,6 +270,68 @@ float liveShadowFactorPCSS(vec3 worldPos, vec3 lightPos, float slot,
     return lit / 9.0;
 }
 
+// The Continuous 5-bit STORAGE transform — the exact math LumelAccumulator
+// uses (Continuous case, incl. the C1 toe) and that fs_lumel_bake.sc mirrors
+// when it bakes an overlay.
+//
+// Why the per-frame differential needs it too: an overlay on disk is a
+// POST-transform quantity. The differential's job is to cancel or restore
+// that stored value, so it must be computed as T(E*Vcur) - T(E*Vfrozen).
+// Subtracting E*(Vcur - Vfrozen) instead — a PRE-transform quantity — is
+// systematically too large, because T subtracts half a quantisation step and
+// then applies the toe. The visible result is exactly symmetric: a newly
+// shadowed surface goes darker than the ambient+bounce floor it should stop
+// at (max(.,0) clamps to black, not to ambient), and a surface the door
+// stops shadowing comes back BRIGHTER than its surroundings. Both reported
+// from the game 2026-08-08.
+//
+// T is nonlinear, so T(a) - T(b) != T(a - b): the substitution IS the bug.
+// Worst exactly where this game lives — the toe is most curved at low
+// levels, and 82% of lit texels sit between 13 and 20/255.
+vec3 lmStoredContribution(vec3 c, float vis, float spot)
+{
+    float peak = max(c.r, max(c.g, c.b));
+    if (peak <= 1e-6 || vis <= 0.0) return vec3(0.0, 0.0, 0.0);
+    // ORDER MATTERS and mirrors LumelAccumulator: the half-step comes off
+    // FIRST, is tested, and only then does the spot factor scale lux.
+    // Folding spot into `c` beforehand shifts where the -0.5 lands and
+    // makes the two ends disagree inside the cone.
+    float lux = peak * 255.0 * vis - 0.5;
+    if (lux <= 0.0) return vec3(0.0, 0.0, 0.0);
+    lux = min(lux * spot, 255.0);
+    if (lux <= 0.0) return vec3(0.0, 0.0, 0.0);
+    vec3 m = c * (255.0 / peak);
+    vec3 gv = m * (lux * 31.0 / 65536.0);
+    vec3 toe = mix(gv - 0.5, 0.5 * gv * gv,
+                   vec3(lessThan(gv, vec3(1.0, 1.0, 1.0))));
+    return max(toe, vec3(0.0, 0.0, 0.0)) * (8.0 / 255.0);
+}
+
+// Spot cone factor, mirroring bakeOneLight: hard cutoff at the outer cosine,
+// linear ramp to the inner. `packed` is u_liveLightSpot[i]: xyz = cone axis
+// scaled by (inner*0.5+0.5), w = outer cosine. A zero-length xyz is the OMNI
+// sentinel — which is also what every non-spot light stores, so omni lights
+// take the identical path they always did.
+//
+// This was MISSING: promoted spot lights had their differential applied over
+// the whole reach SPHERE while their baked overlay only ever existed inside
+// the cone, so outside the cone the differential added or removed light that
+// was never baked.
+float liveSpotFactor(vec4 cone, vec3 toFrag)
+{
+    float len = length(cone.xyz);
+    if (len < 1e-4) return 1.0;                  // omni
+    float inner = len * 2.0 - 1.0;
+    float outer = cone.w;
+    float dotVal = dot(toFrag, cone.xyz / len);
+    if (dotVal <= outer) return 0.0;
+    if (dotVal < inner) {
+        float denom = inner - outer;
+        return (denom > 1e-6) ? (dotVal - outer) / denom : 1.0;
+    }
+    return 1.0;
+}
+
 vec3 liveLightSum(vec3 worldPos, vec3 camPos)
 {
     vec3 sum = vec3(0.0, 0.0, 0.0);
@@ -307,15 +372,41 @@ vec3 liveLightSum(vec3 worldPos, vec3 camPos)
             float t = sw - 100.0;
             float sFrozen = floor(t / 128.0);
             float sCur = t - sFrozen * 128.0;
-            shadow = liveShadowFactor(worldPos, u_liveLightPos[i].xyz,
-                                      sCur, invReach)
-                   - liveShadowFactor(worldPos, u_liveLightPos[i].xyz,
-                                      sFrozen, invReach);
+            // Differential in STORED space (see lmStoredContribution):
+            // the quantity being cancelled is a stored overlay, so both
+            // ends go through the transform before subtracting.
+            // BOTH ends soft. The frozen reference cancels a baked
+            // overlay that was computed with 16 emitter samples, i.e. a
+            // SOFT partial value in the penumbra. Sampling it with a hard
+            // 1-tap test reports 0 where the bake stored something
+            // non-zero, so the differential adds back the FULL amount on
+            // top of a partial one — systematically too bright, and only
+            // on the addition side, which is exactly the asymmetry seen in
+            // game (subtraction correct, closing door leaves a too-bright
+            // region). PCSS emitter size rides u_liveFalloff.y, the same
+            // knob the offscreen bake uses, so the two agree by
+            // construction rather than by tuning.
+            float vCur = liveShadowFactorPCSS(
+                worldPos, u_liveLightPos[i].xyz, sCur, invReach,
+                u_liveFalloff.y, nrm);
+            float vFro = liveShadowFactorPCSS(
+                worldPos, u_liveLightPos[i].xyz, sFrozen, invReach,
+                u_liveFalloff.y, nrm);
+            float spot = liveSpotFactor(u_liveLightSpot[i], -v / dist);
+            vec3 c = u_liveLightColor[i].rgb * (halfLam * fall);
+            sum += lmStoredContribution(c, vCur, spot)
+                 - lmStoredContribution(c, vFro, spot);
+            continue;
         } else {
             shadow = liveShadowFactor(worldPos, u_liveLightPos[i].xyz,
                                       sw, invReach);
         }
-        sum += u_liveLightColor[i].rgb * (halfLam * fall * shadow);
+        // Plain live emitters (lantern, flashlight) are NOT in the baked
+        // atlas, so they add new light rather than cancelling a stored
+        // quantity — they stay linear, deliberately.
+        sum += u_liveLightColor[i].rgb
+             * (halfLam * fall * shadow
+                * liveSpotFactor(u_liveLightSpot[i], -v / dist));
     }
     return sum;
 }

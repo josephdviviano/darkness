@@ -865,6 +865,26 @@ struct RenderConfig {
     // arbiter the diagnostics measure against, and the fallback if a
     // backend's readback misbehaves.
     bool rebakeCpuEvents      = false;
+    // --diag-open-live-gates (DEV-ONLY): bypass the two PER-FRAME gates on
+    // promoted differential lights — the visible-region cull and the
+    // live-light cap. Both drop a light's differential for the frame, and a
+    // dropped differential does not degrade gracefully: the pixel falls back
+    // to the BAKED shadow, which holds the door at its pre-swing pose. So a
+    // light flickering across either gate shows as its shadow snapping
+    // between two door positions. This flag exists to tell "gate churn" apart
+    // from "shadow-pool thrash" in one A/B, because they look identical.
+    bool diagOpenLiveGates    = false;
+    // --diag-cone-probe (DEV-ONLY): measure the differential OUTSIDE the
+    // door's shadow cone, where it must be identically zero. See
+    // DoorShadowSystem::probeOutOfCone for why no existing harness covers
+    // that region.
+    bool diagConeProbe        = false;
+    // --diag-light-density (DEV-ONLY): the number that decides whether
+    // per-pixel direct lighting is affordable. Counts, at visible surface
+    // points, how many static lights contribute ABOVE quantisation — before
+    // and after occlusion. The bake's per-polygon candidate census (~23
+    // reaching lights/poly on MISS6) is an upper bound, not this number.
+    bool diagLightDensity     = false;
     // DEV-ONLY --stress-frob-obj "a,b": send FrobWorldEnd to exactly these
     // object IDs every ~3 s (5 s warmup) through ScriptManager — the same
     // message FrobSystem::executeFrob sends, so lever→ControlDevice→script
@@ -2742,6 +2762,12 @@ inline CliResult applyCliOverrides(int argc, char* argv[], RenderConfig& cfg) {
             cfg.rebakeCpuEvents = true;
         } else if (std::strcmp(argv[i], "--rebake-gpu-events") == 0) {
             cfg.rebakeCpuEvents = false;
+        } else if (std::strcmp(argv[i], "--diag-open-live-gates") == 0) {
+            cfg.diagOpenLiveGates = true;
+        } else if (std::strcmp(argv[i], "--diag-cone-probe") == 0) {
+            cfg.diagConeProbe = true;
+        } else if (std::strcmp(argv[i], "--diag-light-density") == 0) {
+            cfg.diagLightDensity = true;
         } else if (std::strcmp(argv[i], "--shadow-crosscheck") == 0) {
             // Optional pair-count argument: --shadow-crosscheck 50000
             cfg.shadowCrossCheckPairs = 20000;

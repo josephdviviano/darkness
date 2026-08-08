@@ -543,6 +543,13 @@ struct BakeStats {
     uint64_t gatherUnproven = 0;   // budget/degenerate — scored as open
     uint64_t lumelsGathered = 0;
     uint64_t bounceSum255 = 0;     // Σ per-lumel bounce peak ×255 (mean = /lumelsGathered)
+    // Bounce DISTRIBUTION, not just its mean. The mean answers "is there
+    // bounce"; the question that decides whether a dynamic-GI system earns
+    // its cost in this game is "where does bounce MATTER", and a level whose
+    // indirect is a flat ambient constant plus a 1/255 mean has a very
+    // different answer from one with a long tail. 64 buckets of peak×255,
+    // last bucket saturating.
+    uint64_t bounceHist[64] = {};
     uint64_t aoSumMil = 0;         // Σ per-lumel openness ×1e6
     // Dominant-direction atlas: Σ directionality ratio ×1e6 and texel count.
     uint64_t dirRatioSumMil = 0;
@@ -1616,6 +1623,7 @@ inline void mergeBakeStats(BakeStats &dst, const BakeStats &src) {
     dst.gatherUnproven += src.gatherUnproven;
     dst.lumelsGathered += src.lumelsGathered;
     dst.bounceSum255 += src.bounceSum255;
+    for (int b = 0; b < 64; ++b) dst.bounceHist[b] += src.bounceHist[b];
     dst.aoSumMil += src.aoSumMil;
     dst.dirRatioSumMil += src.dirRatioSumMil;
     dst.dirTexels += src.dirTexels;
@@ -2552,8 +2560,10 @@ inline void bakeAtlasWithOverlays(const WRParsedData &wr,
                         ++st.lumelsGathered;
                         const float bpk =
                             std::max({bounce.x, bounce.y, bounce.z});
-                        st.bounceSum255 += static_cast<uint64_t>(
-                            std::min(255.0f, bpk * 255.0f));
+                        const float bpk255 = std::min(255.0f, bpk * 255.0f);
+                        st.bounceSum255 += static_cast<uint64_t>(bpk255);
+                        ++st.bounceHist[std::min(63,
+                            static_cast<int>(bpk255))];
                         st.aoSumMil += static_cast<uint64_t>(
                             openness * 1e6f);
 
