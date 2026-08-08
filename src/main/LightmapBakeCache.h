@@ -65,7 +65,10 @@ constexpr uint32_t kLmBakeCacheMagic    = 0x424D4C44; // "DLMB" little-endian
 //     lights move from base to overlays, so the decomposition differs.
 // v8: per-rec door-static direction snapshot (the runtime direction
 //     recombine's base term).
-constexpr uint32_t kLmBakeCacheVersion  = 8;
+// v9: the lightmap atlas and the whole blend store (base crops, per-light
+//     overlays) are half-float, not 8-bit. Every payload size changed, so a
+//     v8 file is not readable as v9 even where the numbers would agree.
+constexpr uint32_t kLmBakeCacheVersion  = 9;
 // Bump when the bake FORMULA changes meaning — i.e. when identical parameters
 // would now produce different lumels. Parameter changes do not need a bump;
 // they are part of the key.
@@ -85,7 +88,14 @@ constexpr uint32_t kLmBakeCacheVersion  = 8;
 //   v7: door-adjacent lights contribute NO direction at load — the
 //       runtime recombine (init + door events) is the sole author of
 //       their direction term, killing the double count.
-constexpr uint32_t kLmBakeFormulaVersion = 7;
+//   v8: half-float storage END TO END — the atlas, the base crops, the
+//       overlays and the gather's phase-A radiance source. Identical
+//       parameters now produce different lumels for three reasons and all
+//       three are the point: the 0..1 upper clamp is gone (bright texels
+//       keep their real values instead of pinning at 1.0), values are no
+//       longer truncated to 1/255 at four separate points in the pipeline,
+//       and the bounce gather reads unquantised direct light.
+constexpr uint32_t kLmBakeFormulaVersion = 8;
 
 struct LmBakeCacheKey {
     uint64_t missionHash = 0;
@@ -176,17 +186,34 @@ inline bool getBytes(const std::vector<uint8_t> &v, size_t &off,
     off += n;
     return true;
 }
+// Half-float payloads (the atlas and the blend store) go to disk as raw
+// little-endian uint16 — the same POD-copy convention `put`/`get` already use
+// for the header's ints and floats. The cache is a per-user derived file, not
+// an interchange format.
+inline void putHalves(std::vector<uint8_t> &v, const std::vector<uint16_t> &h) {
+    const uint8_t *p = reinterpret_cast<const uint8_t *>(h.data());
+    v.insert(v.end(), p, p + h.size() * sizeof(uint16_t));
+}
+inline bool getHalves(const std::vector<uint8_t> &v, size_t &off,
+                      std::vector<uint16_t> &out, size_t count) {
+    const size_t n = count * sizeof(uint16_t);
+    if (off + n > v.size()) return false;
+    out.resize(count);
+    std::memcpy(out.data(), v.data() + off, n);
+    off += n;
+    return true;
+}
 } // namespace detail
 
 inline bool writeLightmapBakeCache(const std::string &cachePath,
                                    const LmBakeCacheKey &key,
-                                   const AtlasTexture &atlas,
+                                   const HdrAtlasTexture &atlas,
                                    const std::vector<RebakedAnimPoly> &animPolys,
                                    const AtlasTexture *dirAtlas = nullptr) {
     // Serialise the logical stream, then compress once.
     std::vector<uint8_t> blob;
-    blob.reserve(atlas.rgba.size() + (1u << 20));
-    blob.insert(blob.end(), atlas.rgba.begin(), atlas.rgba.end());
+    blob.reserve(atlas.texels.size() * sizeof(uint16_t) + (1u << 20));
+    detail::putHalves(blob, atlas.texels);
     detail::put(blob, static_cast<uint32_t>(animPolys.size()));
     for (const auto &rec : animPolys) {
         detail::put(blob, rec.ci);
@@ -198,9 +225,9 @@ inline bool writeLightmapBakeCache(const std::string &cachePath,
             detail::put(blob, k < rec.overlayLightIdx.size()
                                   ? rec.overlayLightIdx[k]
                                   : static_cast<int16_t>(-1));
-        blob.insert(blob.end(), rec.baseCrop.begin(), rec.baseCrop.end());
+        detail::putHalves(blob, rec.baseCrop);
         for (const auto &ov : rec.overlays)
-            blob.insert(blob.end(), ov.begin(), ov.end());
+            detail::putHalves(blob, ov);
         // v8: door-static direction snapshot (empty on non-door polys).
         detail::put(blob, static_cast<uint8_t>(rec.dirBase.empty() ? 0 : 1));
         if (!rec.dirBase.empty()) {
@@ -257,7 +284,7 @@ inline bool writeLightmapBakeCache(const std::string &cachePath,
 // exclude.
 inline bool readLightmapBakeCache(const std::string &cachePath,
                                   const LmBakeCacheKey &key,
-                                  AtlasTexture &atlas,
+                                  HdrAtlasTexture &atlas,
                                   std::vector<RebakedAnimPoly> &animPolys,
                                   std::string &whyMiss,
                                   AtlasTexture *dirAtlas = nullptr) {
@@ -323,12 +350,19 @@ inline bool readLightmapBakeCache(const std::string &cachePath,
         whyMiss = "decompression failed"; return false;
     }
 
-    const size_t atlasBytes = static_cast<size_t>(atlasSize) * atlasSize * 4;
+    // Two different texel sizes now: the lightmap atlas is RGBA16F (8 B) and
+    // the direction atlas is still RGBA8 (4 B). Keeping one `atlasBytes` for
+    // both is exactly how a format change turns into a silently misparsed
+    // blob, so they are named apart.
+    const size_t atlasComponents = static_cast<size_t>(atlasSize) * atlasSize * 4;
+    const size_t lmAtlasBytes  = atlasComponents * sizeof(uint16_t);
+    const size_t dirAtlasBytes = atlasComponents;
     size_t boff = 0;
-    if (blob.size() < atlasBytes) { whyMiss = "atlas payload short"; return false; }
+    if (blob.size() < lmAtlasBytes) { whyMiss = "atlas payload short"; return false; }
     atlas.size = static_cast<int>(atlasSize);
-    atlas.rgba.assign(blob.begin(), blob.begin() + atlasBytes);
-    boff = atlasBytes;
+    if (!detail::getHalves(blob, boff, atlas.texels, atlasComponents)) {
+        whyMiss = "atlas payload short"; return false;
+    }
 
     uint32_t numPolys = 0;
     if (!get(blob, boff, numPolys)) { whyMiss = "poly count missing"; return false; }
@@ -350,12 +384,12 @@ inline bool readLightmapBakeCache(const std::string &cachePath,
                 whyMiss = "overlay index truncated"; return false;
             }
         const size_t crop = static_cast<size_t>(w) * h * 3;
-        if (!detail::getBytes(blob, boff, rec.baseCrop, crop)) {
+        if (!detail::getHalves(blob, boff, rec.baseCrop, crop)) {
             whyMiss = "base crop truncated"; return false;
         }
         rec.overlays.resize(nOv);
         for (uint32_t k = 0; k < nOv; ++k)
-            if (!detail::getBytes(blob, boff, rec.overlays[k], crop)) {
+            if (!detail::getHalves(blob, boff, rec.overlays[k], crop)) {
                 whyMiss = "overlay payload truncated"; return false;
             }
         // v8: door-static direction snapshot.
@@ -377,15 +411,15 @@ inline bool readLightmapBakeCache(const std::string &cachePath,
     uint8_t hasDir = 0;
     if (!get(blob, boff, hasDir)) { whyMiss = "dir flag missing"; return false; }
     if (hasDir) {
-        if (blob.size() - boff < atlasBytes) {
+        if (blob.size() - boff < dirAtlasBytes) {
             whyMiss = "dir atlas truncated"; return false;
         }
         if (dirAtlas) {
             dirAtlas->size = static_cast<int>(atlasSize);
             dirAtlas->rgba.assign(blob.begin() + boff,
-                                  blob.begin() + boff + atlasBytes);
+                                  blob.begin() + boff + dirAtlasBytes);
         }
-        boff += atlasBytes;
+        boff += dirAtlasBytes;
     } else if (dirAtlas) {
         dirAtlas->size = 0;
         dirAtlas->rgba.clear();

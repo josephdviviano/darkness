@@ -24,6 +24,7 @@
 
 #pragma once
 
+#include "HalfFloat.h"
 #include "WRChunkParser.h"
 
 #include <algorithm>
@@ -103,13 +104,53 @@ struct LmapEntry {
     int pixelW, pixelH;      // dimensions in atlas (= lx, ly)
 };
 
+// RGBA8 atlas — the DIRECTION layer only (octahedral dir, directionality
+// ratio, hemisphere openness). All three are bounded quantities in [0,1] whose
+// smallest meaningful step is far above 1/255, so 8 bits is genuinely enough
+// there. The radiance atlas is a different problem and a different type; see
+// HdrAtlasTexture.
 struct AtlasTexture {
     int size;                // edge length (power of 2)
     std::vector<uint8_t> rgba; // size * size * 4 bytes
 };
 
+// RGBA16F atlas — the LIGHTMAP itself.
+//
+// This was RGBA8 until 2026-08-08 and the format was the dominant source of
+// visible banding, for a reason that only shows up when you measure where the
+// data actually sits rather than what the container permits. Measured on
+// MISS6's re-bake: the median lit texel is 14/255 and 91% of lit texels are
+// below 32/255 — the whole level lives in the bottom 6% of the range, where
+// one 8-bit count is a 7.1% relative step. 82% of lit texels sit between
+// 13/255 and 20/255, which is EIGHT distinct codes for four fifths of the
+// level. At the other end, 0.985% of texels were pinned flat at 255 by a
+// clamp, destroying the bright regions that should read as brightest and
+// starving the bloom chain of anything above 1.0.
+//
+// Half-float fixes both ends at once because its precision is RELATIVE: that
+// same 13..20/255 band holds 639 distinct values instead of 8, the step at the
+// median texel is 0.04% instead of 7.1%, and the ceiling moves from 1.0 to
+// 65504 so the clamp could be deleted outright.
+//
+// Half rather than float32 because the atlas is 64 MB at 4096² and this
+// doubles it; RGBA rather than RGB because bgfx has no three-channel half
+// format (R16F/RG16F/RGBA16F only), so the fourth channel is paid for whether
+// used or not. It is currently written as 1.0 and read by nothing —
+// deliberately reserved rather than speculatively defined; the leading
+// candidate is a per-texel baked shadow term for the S4 demotion ladder, and
+// the multi-light case it would otherwise have to solve is already handled
+// exactly by the per-light overlay decomposition.
+//
+// Modern practice agrees on HDR lightmaps: Godot bakes to RGBAH (half) and
+// reserves RGBA8 for its shadowMASK; Unity's high-quality mode is HDR (BC6H),
+// with 8-bit RGBM only as a fallback. Both attributions in NOTES.SOURCE.md.
+struct HdrAtlasTexture {
+    int size = 0;                 // edge length (power of 2)
+    std::vector<uint16_t> texels; // size * size * 4 halves
+};
+
 struct LightmapAtlasSet {
-    std::vector<AtlasTexture> atlases;
+    std::vector<HdrAtlasTexture> atlases;
     // entries[cellIdx][polyIdx] for O(1) lookup during mesh building
     std::vector<std::vector<LmapEntry>> entries;
 };
@@ -119,36 +160,41 @@ struct LightmapAtlasSet {
 // This prevents bilinear/bicubic filtering from sampling neighboring lightmaps.
 // dataX/dataY = top-left of the actual data; lx/ly = data dimensions.
 // The padding area is dataX-2..dataX+lx+1, dataY-2..dataY+ly+1.
-inline void fillEdgePadding(std::vector<uint8_t> &rgba, int atlasSize,
+// Templated on the texel component so the RGBA8 direction atlas and the
+// RGBA16F lightmap atlas share one implementation — the padding is a pure
+// copy and never looks at what the components mean.
+template <typename Texel>
+inline void fillEdgePadding(std::vector<Texel> &rgba, int atlasSize,
                             int dataX, int dataY, int lx, int ly, int pad = 2) {
+    constexpr size_t kTexelBytes = 4 * sizeof(Texel);
     // Helper: get a pointer to the RGBA pixel at (px, py) in the atlas
-    auto pixel = [&](int px, int py) -> uint8_t * {
-        return &rgba[(py * atlasSize + px) * 4];
+    auto pixel = [&](int px, int py) -> Texel * {
+        return &rgba[(static_cast<size_t>(py) * atlasSize + px) * 4];
     };
 
     // Fill left/right padding columns (including corners)
     for (int dy = -pad; dy < ly + pad; ++dy) {
         int srcRow = std::max(0, std::min(ly - 1, dy));
         // Left 2 columns: repeat leftmost data pixel in this row
-        const uint8_t *srcLeft = pixel(dataX, dataY + srcRow);
+        const Texel *srcLeft = pixel(dataX, dataY + srcRow);
         for (int dx = -pad; dx < 0; ++dx)
-            std::memcpy(pixel(dataX + dx, dataY + dy), srcLeft, 4);
+            std::memcpy(pixel(dataX + dx, dataY + dy), srcLeft, kTexelBytes);
         // Right 2 columns: repeat rightmost data pixel in this row
-        const uint8_t *srcRight = pixel(dataX + lx - 1, dataY + srcRow);
+        const Texel *srcRight = pixel(dataX + lx - 1, dataY + srcRow);
         for (int dx = lx; dx < lx + pad; ++dx)
-            std::memcpy(pixel(dataX + dx, dataY + dy), srcRight, 4);
+            std::memcpy(pixel(dataX + dx, dataY + dy), srcRight, kTexelBytes);
     }
 
     // Fill top/bottom padding rows (between the left/right columns already filled)
     for (int dx = 0; dx < lx; ++dx) {
         // Top 2 rows: repeat topmost data pixel in this column
-        const uint8_t *srcTop = pixel(dataX + dx, dataY);
+        const Texel *srcTop = pixel(dataX + dx, dataY);
         for (int dy = -pad; dy < 0; ++dy)
-            std::memcpy(pixel(dataX + dx, dataY + dy), srcTop, 4);
+            std::memcpy(pixel(dataX + dx, dataY + dy), srcTop, kTexelBytes);
         // Bottom 2 rows: repeat bottommost data pixel in this column
-        const uint8_t *srcBot = pixel(dataX + dx, dataY + ly - 1);
+        const Texel *srcBot = pixel(dataX + dx, dataY + ly - 1);
         for (int dy = ly; dy < ly + pad; ++dy)
-            std::memcpy(pixel(dataX + dx, dataY + dy), srcBot, 4);
+            std::memcpy(pixel(dataX + dx, dataY + dy), srcBot, kTexelBytes);
     }
 }
 
@@ -224,18 +270,20 @@ inline LightmapAtlasSet buildLightmapAtlases(const WRParsedData &wr) {
         }
 
         // All fit — build the atlas texture
-        AtlasTexture atlas;
+        HdrAtlasTexture atlas;
         atlas.size = atlasSize;
-        atlas.rgba.resize(atlasSize * atlasSize * 4, 0);
+        atlas.texels.assign(static_cast<size_t>(atlasSize) * atlasSize * 4, 0);
+        const uint16_t kHalfOne = floatToHalf(1.0f);
 
         // Fill the white fallback block
         for (int dy = 0; dy < 2; ++dy) {
             for (int dx = 0; dx < 2; ++dx) {
-                int px = (whiteBlock->y + dy) * atlasSize + (whiteBlock->x + dx);
-                atlas.rgba[px * 4 + 0] = 255;
-                atlas.rgba[px * 4 + 1] = 255;
-                atlas.rgba[px * 4 + 2] = 255;
-                atlas.rgba[px * 4 + 3] = 255;
+                size_t px = static_cast<size_t>(whiteBlock->y + dy) * atlasSize
+                          + (whiteBlock->x + dx);
+                atlas.texels[px * 4 + 0] = kHalfOne;
+                atlas.texels[px * 4 + 1] = kHalfOne;
+                atlas.texels[px * 4 + 2] = kHalfOne;
+                atlas.texels[px * 4 + 3] = kHalfOne;
             }
         }
 
@@ -282,15 +330,23 @@ inline LightmapAtlasSet buildLightmapAtlases(const WRParsedData &wr) {
                     uint8_t r, g, b;
                     convertLmPixel(&lmData[srcOff], wr.lightSize, r, g, b);
 
-                    atlas.rgba[dstPx * 4 + 0] = r;
-                    atlas.rgba[dstPx * 4 + 1] = g;
-                    atlas.rgba[dstPx * 4 + 2] = b;
-                    atlas.rgba[dstPx * 4 + 3] = 255;
+                    // The shipped bytes ARE the vintage truth. Widening n/255
+                    // to half is not bit-exact (those are not dyadic
+                    // rationals) but it is far below the source's own quantum:
+                    // measured max error 2.4e-4, i.e. 0.062 of ONE 8-bit
+                    // count, and every value round-trips to the same 8-bit
+                    // code. Invariant 2 — vintage is the shipped atlas,
+                    // untouched — survives; the container widened, the numbers
+                    // did not move.
+                    atlas.texels[dstPx * 4 + 0] = floatToHalf(r / 255.0f);
+                    atlas.texels[dstPx * 4 + 1] = floatToHalf(g / 255.0f);
+                    atlas.texels[dstPx * 4 + 2] = floatToHalf(b / 255.0f);
+                    atlas.texels[dstPx * 4 + 3] = kHalfOne;
                 }
             }
 
             // Fill 2px edge-clamped padding around the data
-            fillEdgePadding(atlas.rgba, atlasSize, dataX, dataY, ref.lx, ref.ly);
+            fillEdgePadding(atlas.texels, atlasSize, dataX, dataY, ref.lx, ref.ly);
 
             // Record atlas UV entry — UVs point to inner data region (inside padding)
             LmapEntry &entry = result.entries[ref.cellIdx][ref.polyIdx];
@@ -354,9 +410,9 @@ inline LightmapAtlasSet scaleAtlasPlacement(const LightmapAtlasSet &src,
         }
     }
     for (const auto &a : src.atlases) {
-        AtlasTexture t;
+        HdrAtlasTexture t;
         t.size = a.size * density;
-        t.rgba.assign(static_cast<size_t>(t.size) * t.size * 4, 0);
+        t.texels.assign(static_cast<size_t>(t.size) * t.size * 4, 0);
         out.atlases.push_back(std::move(t));
     }
     return out;
@@ -377,7 +433,7 @@ inline LightmapAtlasSet scaleAtlasPlacement(const LightmapAtlasSet &src,
 //   entry       — atlas entry with pixel position/size
 //   intensities — lightnum → current intensity (0.0-1.0) for each animated light
 inline void blendAnimatedLightmap(
-    AtlasTexture &atlas,
+    HdrAtlasTexture &atlas,
     const WRParsedData &wr,
     uint32_t cellIdx, int polyIdx,
     const LmapEntry &entry,
@@ -437,7 +493,11 @@ inline void blendAnimatedLightmap(
         ++overlayIdx;
     }
 
-    // Clamp to [0, 1]
+    // Clamp to [0, 1]. This is the VINTAGE path — the shipped 5:5:5 lumels
+    // accumulate clamped at 31 and the original's blend clamps too, so the
+    // ceiling here is authentic and stays (invariant 2: vintage is the shipped
+    // atlas, untouched). Only the RE-BAKE path dropped its clamp when the
+    // atlas went half-float.
     for (auto &v : blended)
         v = std::max(0.0f, std::min(1.0f, v));
 
@@ -461,15 +521,15 @@ inline void blendAnimatedLightmap(
             int srcOff = (py * lx + px) * 3;
             int dstPx = (entry.pixelY + py) * atlas.size + (entry.pixelX + px);
 
-            atlas.rgba[dstPx * 4 + 0] = static_cast<uint8_t>(blended[srcOff + 0] * 255.0f);
-            atlas.rgba[dstPx * 4 + 1] = static_cast<uint8_t>(blended[srcOff + 1] * 255.0f);
-            atlas.rgba[dstPx * 4 + 2] = static_cast<uint8_t>(blended[srcOff + 2] * 255.0f);
-            atlas.rgba[dstPx * 4 + 3] = 255;
+            atlas.texels[dstPx * 4 + 0] = floatToHalf(blended[srcOff + 0]);
+            atlas.texels[dstPx * 4 + 1] = floatToHalf(blended[srcOff + 1]);
+            atlas.texels[dstPx * 4 + 2] = floatToHalf(blended[srcOff + 2]);
+            atlas.texels[dstPx * 4 + 3] = floatToHalf(1.0f);
         }
     }
 
     // Re-fill 2px edge padding so GPU filtering stays correct after blend
-    fillEdgePadding(atlas.rgba, atlas.size, entry.pixelX, entry.pixelY, lx, ly);
+    fillEdgePadding(atlas.texels, atlas.size, entry.pixelX, entry.pixelY, lx, ly);
 }
 
 } // namespace Darkness

@@ -1558,21 +1558,28 @@ inline bool bakePolygon(const WRParsedData &wr,
 // Shared by the threaded and serial paths; each polygon owns a disjoint
 // rectangle, which is what makes the threading lock-free.
 inline void writeLumelsToAtlas(const std::vector<Vector3> &lumels,
-                               const LmapEntry &e, AtlasTexture &out,
+                               const LmapEntry &e, HdrAtlasTexture &out,
                                int density = 1) {
+    // No upper clamp. It used to be min(1.0f, ...) and it was pinning 0.985%
+    // of MISS6's lit texels flat at the ceiling — the bright regions, which
+    // are exactly the ones that should read as brightest, and exactly the
+    // values the HDR target and bloom chain want above 1.0. Half-float reaches
+    // 65504, so the ceiling is no longer a thing the bake has to think about.
+    // The lower clamp stays: negative radiance is meaningless, not headroom.
+    const uint16_t kHalfOne = floatToHalf(1.0f);
     for (int y = 0; y < e.pixelH; ++y) {
         for (int x = 0; x < e.pixelW; ++x) {
             const Vector3 &v = lumels[static_cast<size_t>(y) * e.pixelW + x];
             const size_t px = (static_cast<size_t>(e.pixelY + y) * out.size
                                + (e.pixelX + x)) * 4;
-            if (px + 3 >= out.rgba.size()) continue;
-            out.rgba[px + 0] = static_cast<uint8_t>(
-                std::min(1.0f, std::max(0.0f, v.x)) * 255.0f);
-            out.rgba[px + 1] = static_cast<uint8_t>(
-                std::min(1.0f, std::max(0.0f, v.y)) * 255.0f);
-            out.rgba[px + 2] = static_cast<uint8_t>(
-                std::min(1.0f, std::max(0.0f, v.z)) * 255.0f);
-            out.rgba[px + 3] = 255;
+            if (px + 3 >= out.texels.size()) continue;
+            out.texels[px + 0] = floatToHalf(std::max(0.0f, v.x));
+            out.texels[px + 1] = floatToHalf(std::max(0.0f, v.y));
+            out.texels[px + 2] = floatToHalf(std::max(0.0f, v.z));
+            // Reserved; see HdrAtlasTexture. Written as 1.0 so a consumer that
+            // multiplies by it before the channel is defined is a no-op rather
+            // than a black screen.
+            out.texels[px + 3] = kHalfOne;
         }
     }
     // Same edge-clamp the shipped packer applies, so filtering at polygon
@@ -1582,7 +1589,7 @@ inline void writeLumelsToAtlas(const std::vector<Vector3> &lumels,
     // the gap is 2*density leaves an unwritten black ring around every one of
     // the mission's ~26k lightmap rectangles, which reads on screen as exactly
     // the blocky grid this whole exercise exists to remove.
-    fillEdgePadding(out.rgba, out.size, e.pixelX, e.pixelY, e.pixelW, e.pixelH,
+    fillEdgePadding(out.texels, out.size, e.pixelX, e.pixelY, e.pixelW, e.pixelH,
                     2 * density);
 }
 
@@ -1634,7 +1641,7 @@ inline void bakeAtlasInPlace(const WRParsedData &wr,
                              const RenderParams &rp,
                              const BakeFormula &f,
                              const LightmapAtlasSet &placement,
-                             AtlasTexture &out,
+                             HdrAtlasTexture &out,
                              BakeStats &stats,
                              int threads = 0) {
     // Each light's containing cell, resolved once — the light→surface trace
@@ -1806,13 +1813,13 @@ struct RebakedAnimPoly {
     uint32_t ci = 0;
     int32_t  pi = 0;
     int      w = 0, h = 0;          // atlas rect dims at bake density
-    // Pristine base crop (RGB8). The blend source — the atlas buffer itself
-    // gets overwritten by blends, so the base must survive separately.
-    std::vector<uint8_t> baseCrop;
-    // One RGB8 buffer per overlay, in animflags bit order (lowest set bit
+    // Pristine base crop (RGB half). The blend source — the atlas buffer
+    // itself gets overwritten by blends, so the base must survive separately.
+    std::vector<uint16_t> baseCrop;
+    // One RGB half buffer per overlay, in animflags bit order (lowest set bit
     // first) — the same order the shipped file stores and the blend walks.
     // An overlay whose animMap entry is out of range bakes empty (all zero).
-    std::vector<std::vector<uint8_t>> overlays;
+    std::vector<std::vector<uint16_t>> overlays;
     // The static-table light behind each overlay (animMap[bit]) — which is
     // also the number runtime intensities are keyed by. -1 = unmapped.
     std::vector<int16_t> overlayLightIdx;
@@ -1877,16 +1884,24 @@ inline void writeDirTexelsToAtlas(const std::vector<DirAccum> &polyDir,
 inline void blendRebakedLightmap(const RebakedAnimPoly &rec,
                                  const LmapEntry &entry,
                                  const std::unordered_map<int16_t, float> &intensities,
-                                 AtlasTexture &atlas,
+                                 HdrAtlasTexture &atlas,
                                  int density,
                                  const std::unordered_map<int16_t, Vector3> *tints
                                      = nullptr) {
     const size_t count = static_cast<size_t>(rec.w) * rec.h;
     if (rec.baseCrop.size() < count * 3) return;
 
+    // MEASURED 2026-08-08, and left alone deliberately: replacing this with
+    // a reused thread_local scratch made a door event WORSE — 150 ms vs
+    // 40 ms for the same 806 polys — because on this toolchain every
+    // subscript of a thread_local paid a TLS lookup inside the inner loop.
+    // Hoisting to a raw pointer should fix that, but the tree stopped
+    // building mid-experiment and it is NOT measured, so the known-good
+    // form stays until it can be.
+    const uint16_t kHalfOne = floatToHalf(1.0f);
     std::vector<float> blended(count * 3);
     for (size_t i = 0; i < count * 3; ++i)
-        blended[i] = rec.baseCrop[i] / 255.0f;
+        blended[i] = halfToFloat(rec.baseCrop[i]);
 
     for (size_t k = 0; k < rec.overlays.size(); ++k) {
         float scale[3] = {1.0f, 1.0f, 1.0f};
@@ -1910,9 +1925,9 @@ inline void blendRebakedLightmap(const RebakedAnimPoly &rec,
         const auto &ov = rec.overlays[k];
         if (ov.size() < count * 3) continue;
         for (size_t i = 0; i < count * 3; i += 3) {
-            blended[i + 0] += scale[0] * (ov[i + 0] / 255.0f);
-            blended[i + 1] += scale[1] * (ov[i + 1] / 255.0f);
-            blended[i + 2] += scale[2] * (ov[i + 2] / 255.0f);
+            blended[i + 0] += scale[0] * halfToFloat(ov[i + 0]);
+            blended[i + 1] += scale[1] * halfToFloat(ov[i + 1]);
+            blended[i + 2] += scale[2] * halfToFloat(ov[i + 2]);
         }
     }
 
@@ -1921,29 +1936,36 @@ inline void blendRebakedLightmap(const RebakedAnimPoly &rec,
             const size_t src = (static_cast<size_t>(y) * rec.w + x) * 3;
             const size_t dst = (static_cast<size_t>(entry.pixelY + y) * atlas.size
                                + (entry.pixelX + x)) * 4;
-            if (dst + 3 >= atlas.rgba.size()) continue;
+            if (dst + 3 >= atlas.texels.size()) continue;
             for (int c = 0; c < 3; ++c)
-                atlas.rgba[dst + c] = static_cast<uint8_t>(
-                    std::min(1.0f, std::max(0.0f, blended[src + c])) * 255.0f);
-            atlas.rgba[dst + 3] = 255;
+                atlas.texels[dst + c] =
+                    floatToHalf(std::max(0.0f, blended[src + c]));
+            atlas.texels[dst + 3] = kHalfOne;   // hoisted: it is a constant
         }
     }
     // Same density-scaled padding rule as writeLumelsToAtlas — an unpadded
     // blend would reintroduce the black-ring artefact at every blended rect.
-    fillEdgePadding(atlas.rgba, atlas.size, entry.pixelX, entry.pixelY,
+    fillEdgePadding(atlas.texels, atlas.size, entry.pixelX, entry.pixelY,
                     rec.w, rec.h, 2 * density);
 }
 
-inline void packLumelsRGB8(const std::vector<Vector3> &lumels,
-                           std::vector<uint8_t> &out) {
+// The blend store (base crop + per-light overlays) in the same half-float the
+// atlas uses. Three channels, not four: these buffers never reach the GPU
+// directly — blendRebakedLightmap sums them into the atlas on the CPU — so
+// there is no format alignment to satisfy and the fourth channel would be
+// 15 MB of nothing on MISS6.
+//
+// Storing these at 8 bits was the second half of the banding problem: an
+// animated or door-lit polygon's atlas content is RECONSTRUCTED from these
+// buffers on every blend, so an HDR atlas fed from 8-bit sources would still
+// step. Same no-upper-clamp rule as writeLumelsToAtlas.
+inline void packLumelsHalf3(const std::vector<Vector3> &lumels,
+                            std::vector<uint16_t> &out) {
     out.resize(lumels.size() * 3);
     for (size_t i = 0; i < lumels.size(); ++i) {
-        out[i * 3 + 0] = static_cast<uint8_t>(
-            std::min(1.0f, std::max(0.0f, lumels[i].x)) * 255.0f);
-        out[i * 3 + 1] = static_cast<uint8_t>(
-            std::min(1.0f, std::max(0.0f, lumels[i].y)) * 255.0f);
-        out[i * 3 + 2] = static_cast<uint8_t>(
-            std::min(1.0f, std::max(0.0f, lumels[i].z)) * 255.0f);
+        out[i * 3 + 0] = floatToHalf(std::max(0.0f, lumels[i].x));
+        out[i * 3 + 1] = floatToHalf(std::max(0.0f, lumels[i].y));
+        out[i * 3 + 2] = floatToHalf(std::max(0.0f, lumels[i].z));
     }
 }
 
@@ -1973,7 +1995,7 @@ inline void bakeAtlasWithOverlays(const WRParsedData &wr,
                                   const RenderParams &rp,
                                   const BakeFormula &f,
                                   const LightmapAtlasSet &placement,
-                                  AtlasTexture &out,
+                                  HdrAtlasTexture &out,
                                   std::vector<RebakedAnimPoly> &animPolys,
                                   BakeStats &stats,
                                   int threads = 0,
@@ -2057,12 +2079,12 @@ inline void bakeAtlasWithOverlays(const WRParsedData &wr,
 
     // The direct-light store the gather reads. Without a gather, Phase A
     // writes the final base straight into `out` (the pre-S6 behaviour).
-    AtlasTexture direct;
+    HdrAtlasTexture direct;
     if (gather) {
         direct.size = out.size;
-        direct.rgba.assign(out.rgba.size(), 0);
+        direct.texels.assign(out.texels.size(), 0);
     }
-    AtlasTexture &phaseATarget = gather ? direct : out;
+    HdrAtlasTexture &phaseATarget = gather ? direct : out;
 
     // Per-polygon lumel grids at OUTPUT density — the gather locates hit
     // texels through these, and building one per ray would double the cost.
@@ -2255,7 +2277,7 @@ inline void bakeAtlasWithOverlays(const WRParsedData &wr,
                     rec.h = e.pixelH;
                     // Without a gather this IS the final base; with one,
                     // Phase B overwrites it after composing.
-                    packLumelsRGB8(lumels, rec.baseCrop);
+                    packLumelsHalf3(lumels, rec.baseCrop);
 
                     uint32_t flags = animflags;
                     while (flags) {
@@ -2264,7 +2286,7 @@ inline void bakeAtlasWithOverlays(const WRParsedData &wr,
                         const int16_t lightIdx =
                             (bit < static_cast<int>(cell.animMap.size()))
                                 ? cell.animMap[bit] : -1;
-                        std::vector<uint8_t> buf;
+                        std::vector<uint16_t> buf;
                         if (lightIdx > 0 &&
                             static_cast<size_t>(lightIdx) <
                                 wr.staticLights.size()) {
@@ -2292,7 +2314,7 @@ inline void bakeAtlasWithOverlays(const WRParsedData &wr,
                                             lightList) &&
                                 static_cast<int>(lumels.size()) ==
                                     e.pixelW * e.pixelH) {
-                                packLumelsRGB8(lumels, buf);
+                                packLumelsHalf3(lumels, buf);
                             }
                         }
                         if (buf.empty())
@@ -2355,14 +2377,14 @@ inline void bakeAtlasWithOverlays(const WRParsedData &wr,
                         if (already) continue;
                         std::fill(overlayMask.begin(), overlayMask.end(), 0);
                         overlayMask[static_cast<size_t>(xli)] = 1;
-                        std::vector<uint8_t> buf;
+                        std::vector<uint16_t> buf;
                         if (bakePolygon(wr, rp, ci, pi, overlayF,
                                         lightCells, lumels, partial[t],
                                         nullptr, overlayMask.data(),
                                         /*dirAccum=*/nullptr, lightList) &&
                             static_cast<int>(lumels.size()) ==
                                 e.pixelW * e.pixelH) {
-                            packLumelsRGB8(lumels, buf);
+                            packLumelsHalf3(lumels, buf);
                         }
                         if (buf.empty())
                             buf.assign(
@@ -2413,11 +2435,15 @@ inline void bakeAtlasWithOverlays(const WRParsedData &wr,
     const Vector3 ambientVal = f.includeAmbient
         ? bakedAmbientValue(rp.ambientLight, f) : Vector3(0.0f);
 
+    // The gather's radiance source. This used to round-trip through 8 bits
+    // between phase A and phase B, so the bounce was gathered from a quantised
+    // copy of the direct light — a second, quieter place the container was
+    // costing fidelity.
     auto readDirect = [&](int x, int y) {
         const size_t px = (static_cast<size_t>(y) * direct.size + x) * 4;
-        return Vector3(direct.rgba[px + 0] / 255.0f,
-                       direct.rgba[px + 1] / 255.0f,
-                       direct.rgba[px + 2] / 255.0f);
+        return Vector3(halfToFloat(direct.texels[px + 0]),
+                       halfToFloat(direct.texels[px + 1]),
+                       halfToFloat(direct.texels[px + 2]));
     };
 
     next.store(0);
@@ -2553,7 +2579,7 @@ inline void bakeAtlasWithOverlays(const WRParsedData &wr,
                     (static_cast<uint64_t>(ci) << 32)
                     | static_cast<uint32_t>(pi));
                 if (it != animIndex.end())
-                    packLumelsRGB8(lumels, it->second->baseCrop);
+                    packLumelsHalf3(lumels, it->second->baseCrop);
             }
         }
     };

@@ -59,7 +59,7 @@ struct LumelBakeBatch {
         int x = 0, y = 0, w = 0, h = 0;
     };
     std::vector<Item> items;
-    std::vector<uint8_t> pixels;   // staging readback, scratch W*H*4
+    std::vector<uint16_t> pixels;  // staging readback (RGBA16F), scratch W*H*4
     uint32_t readyFrame = 0;
     bool inFlight = false;
 };
@@ -72,6 +72,7 @@ struct LumelBakeGPU {
     bgfx::UniformHandle u_bakeNormal = BGFX_INVALID_HANDLE;
     bgfx::UniformHandle u_bakeLight  = BGFX_INVALID_HANDLE;
     bgfx::UniformHandle u_bakeColor  = BGFX_INVALID_HANDLE;
+    bgfx::UniformHandle u_bakeSpot   = BGFX_INVALID_HANDLE;
     // live_lights.sh's shared uniforms, set for THIS view too.
     bgfx::UniformHandle u_liveFalloff    = BGFX_INVALID_HANDLE;
     bgfx::UniformHandle u_liveShadowInfo = BGFX_INVALID_HANDLE;
@@ -103,20 +104,27 @@ inline void initLumelBakeGPU(LumelBakeGPU &g, bgfx::ProgramHandle program) {
                                         bgfx::UniformType::Vec4);
     g.u_bakeColor = bgfx::createUniform("u_bakeColor",
                                         bgfx::UniformType::Vec4);
+    g.u_bakeSpot = bgfx::createUniform("u_bakeSpot",
+                                       bgfx::UniformType::Vec4);
     g.u_liveFalloff = bgfx::createUniform("u_liveFalloff",
                                           bgfx::UniformType::Vec4);
     g.u_liveShadowInfo = bgfx::createUniform("u_liveShadowInfo",
                                              bgfx::UniformType::Vec4);
     g.s_liveShadowAtlas = bgfx::createUniform("s_liveShadowAtlas",
                                               bgfx::UniformType::Sampler);
+    // RGBA16F, matching the lightmap atlas and the blend store. While this
+    // was RGBA8 the GPU event path quantised every overlay it refreshed to
+    // 8 bits and re-introduced banding on exactly the door-lit polygons the
+    // half-float conversion existed to fix — a precision boundary in the
+    // middle of an otherwise HDR pipeline.
     g.scratchTex = bgfx::createTexture2D(
         LumelBakeGPU::kScratchSize, LumelBakeGPU::kScratchSize, false, 1,
-        bgfx::TextureFormat::RGBA8,
+        bgfx::TextureFormat::RGBA16F,
         BGFX_TEXTURE_RT | BGFX_SAMPLER_MIN_POINT | BGFX_SAMPLER_MAG_POINT);
     g.scratchFb = bgfx::createFrameBuffer(1, &g.scratchTex, false);
     g.stagingTex = bgfx::createTexture2D(
         LumelBakeGPU::kScratchSize, LumelBakeGPU::kScratchSize, false, 1,
-        bgfx::TextureFormat::RGBA8,
+        bgfx::TextureFormat::RGBA16F,
         BGFX_TEXTURE_BLIT_DST | BGFX_TEXTURE_READ_BACK);
 }
 
@@ -143,7 +151,7 @@ inline uint32_t kickLumelBatchReadback(LumelBakeGPU &g) {
                LumelBakeGPU::kScratchSize, LumelBakeGPU::kScratchSize);
     g.batch.pixels.assign(static_cast<size_t>(LumelBakeGPU::kScratchSize) *
                               LumelBakeGPU::kScratchSize * 4,
-                          0);
+                          uint16_t(0));
     return bgfx::readTexture(g.stagingTex, g.batch.pixels.data());
 }
 
@@ -158,6 +166,7 @@ inline void destroyLumelBakeGPU(LumelBakeGPU &g) {
     kill(g.u_bakeNormal);
     kill(g.u_bakeLight);
     kill(g.u_bakeColor);
+    kill(g.u_bakeSpot);
     kill(g.u_liveFalloff);
     kill(g.u_liveShadowInfo);
     kill(g.s_liveShadowAtlas);
@@ -187,7 +196,10 @@ inline bool submitLumelRect(const LumelBakeGPU &g, const ShadowMapCache &sc,
                             const Vector3 &lightPos, float reach,
                             const Vector3 &colorK, int slot,
                             float emitterA, int x0, int y0,
-                            float pcssEmitter = -1.0f) {
+                            float pcssEmitter = -1.0f,
+                            const Vector3 &spotDir = Vector3(0.0f),
+                            float spotInner = -1.0f,
+                            float spotOuter = 0.0f) {
     using QuadVertex = LumelQuadVertex;
     static bool layoutInit = false;
     if (!layoutInit) { QuadVertex::init(); layoutInit = true; }
@@ -220,16 +232,25 @@ inline bool submitLumelRect(const LumelBakeGPU &g, const ShadowMapCache &sc,
     const float o[4] = {origin.x, origin.y, origin.z, surfaceOffset};
     const float su[4] = {spanU.x, spanU.y, spanU.z, 0};
     const float sv[4] = {spanV.x, spanV.y, spanV.z, 0};
-    const float nn[4] = {grid.normal.x, grid.normal.y, grid.normal.z, 0};
+    // .w carries the spot's OUTER cone cosine; the cone direction and the
+    // inner cosine ride u_bakeSpot. inner == -1 is the omni sentinel, the
+    // same one WRStaticLight uses, so an omni light takes the identical
+    // path it always did.
+    const float nn[4] = {grid.normal.x, grid.normal.y, grid.normal.z,
+                         spotOuter};
     const float li[4] = {lightPos.x, lightPos.y, lightPos.z, reach * reach};
     const float co[4] = {colorK.x, colorK.y, colorK.z,
                          static_cast<float>(slot)};
     // .x = falloff a^2; .y = the PCSS emitter size (the penumbra the
     // shadow tap synthesises). Decoupled so the self-test can run the
     // falloff physically while pinning the shadow to the exact 1-tap.
+    // .z = one face texel in tile UV, for the conservative blocker search
+    // (thin sub-texel silhouettes). 0 disables it, which keeps any caller
+    // that does not know about it on the exact previous behaviour.
     const float fall[4] = {emitterA * emitterA,
                            pcssEmitter < 0.0f ? emitterA : pcssEmitter,
-                           0, 0};
+                           sc.faceSize > 0 ? 1.0f / float(sc.faceSize) : 0.0f,
+                           0};
     const float info[4] = {
         static_cast<float>(sc.tilesPerRow),
         sc.atlasW > 0 ? float(sc.faceSize) / float(sc.atlasW) : 0.0f,
@@ -240,7 +261,9 @@ inline bool submitLumelRect(const LumelBakeGPU &g, const ShadowMapCache &sc,
     bgfx::setUniform(g.u_bakeSpanV, sv);
     bgfx::setUniform(g.u_bakeNormal, nn);
     bgfx::setUniform(g.u_bakeLight, li);
+    const float sp[4] = {spotDir.x, spotDir.y, spotDir.z, spotInner};
     bgfx::setUniform(g.u_bakeColor, co);
+    bgfx::setUniform(g.u_bakeSpot, sp);
     bgfx::setUniform(g.u_liveFalloff, fall);
     bgfx::setUniform(g.u_liveShadowInfo, info);
     bgfx::setTexture(3, g.s_liveShadowAtlas, sc.atlasTex);
@@ -278,13 +301,16 @@ inline void runLumelBakeSelfTest(LumelBakeGPU &g, ShadowMapCache &sc,
             const int16_t li = rec.overlayLightIdx[k];
             if (li > 0 && static_cast<size_t>(li) < extraLights.size() &&
                 extraLights[li] && k < rec.overlays.size()) {
-                uint8_t peak = 0;
-                for (uint8_t b : rec.overlays[k]) peak = std::max(peak, b);
+                float peak = 0.0f;
+                for (uint16_t b : rec.overlays[k])
+                    peak = std::max(peak, halfToFloat(b));
                 // Meaningful rects only: on tiny polys the CPU's
                 // off-poly clamp-ray texels (which the GPU deliberately
                 // does not mirror) dominate the percentage and the test
                 // measures the known edge construction, not the formula.
-                if (peak >= 24 && rec.w * rec.h >= 64) {
+                // 24/255 in the units this threshold was measured in — the
+                // overlay store is half-float now, the threshold is not.
+                if (peak >= 24.0f / 255.0f && rec.w * rec.h >= 64) {
                     recIdx = r;
                     ovK = k;
                     lightIdx = li;
@@ -336,11 +362,11 @@ inline void runLumelBakeSelfTest(LumelBakeGPU &g, ShadowMapCache &sc,
     const uint16_t rtW = static_cast<uint16_t>(grid.lx);
     const uint16_t rtH = static_cast<uint16_t>(grid.ly);
     bgfx::TextureHandle rt = bgfx::createTexture2D(
-        rtW, rtH, false, 1, bgfx::TextureFormat::RGBA8,
+        rtW, rtH, false, 1, bgfx::TextureFormat::RGBA16F,
         BGFX_TEXTURE_RT | BGFX_SAMPLER_MIN_POINT | BGFX_SAMPLER_MAG_POINT);
     bgfx::FrameBufferHandle fb = bgfx::createFrameBuffer(1, &rt, false);
     bgfx::TextureHandle staging = bgfx::createTexture2D(
-        rtW, rtH, false, 1, bgfx::TextureFormat::RGBA8,
+        rtW, rtH, false, 1, bgfx::TextureFormat::RGBA16F,
         BGFX_TEXTURE_BLIT_DST | BGFX_TEXTURE_READ_BACK);
 
     bgfx::setViewFrameBuffer(kViewLumelBake, fb);
@@ -365,20 +391,24 @@ inline void runLumelBakeSelfTest(LumelBakeGPU &g, ShadowMapCache &sc,
     // pcssEmitter = 0: the self-test pins the GPU to the exact hard tap
     // (the CPU reference bakes penumbra-free); penumbra parity is the
     // --door-diff-diag harness's metric, not this one's.
+    // The cone goes in here too, or a SPOT test light diverges by exactly
+    // the spot factor — which is how this test caught the omni-only default
+    // the moment spot support landed. It is supposed to be strict.
     if (!submitLumelRect(g, sc, grid, formula.surfaceOffset, L.loc, reach,
                          colorK, slot, formula.emitterRadius, 0, 0,
-                         /*pcssEmitter=*/0.0f)) {
+                         /*pcssEmitter=*/0.0f, L.dir, L.inner, L.outer)) {
         std::fprintf(stderr, "[LUMEL_BAKE] submit failed\n");
         bgfx::destroy(fb); bgfx::destroy(rt); bgfx::destroy(staging);
         return;
     }
     bgfx::blit(kViewLumelRead, staging, 0, 0, rt, 0, 0, rtW, rtH);
-    std::vector<uint8_t> pixels(static_cast<size_t>(rtW) * rtH * 4);
+    std::vector<uint16_t> pixels(static_cast<size_t>(rtW) * rtH * 4);
     const uint32_t ready = bgfx::readTexture(staging, pixels.data());
     uint32_t cur = bgfx::frame();
     while (cur < ready) cur = bgfx::frame();
 
-    // Compare (GPU RGBA8 vs CPU floats clamped to the same 8-bit scale).
+    // Compare in /255 counts — the unit every acceptance number for this
+    // test was recorded in — even though both sides are now float.
     // The top-left GPU row is lumel row 0 on Metal/D3D; GL readback is
     // bottom-up — same flip the shadow-atlas readback applies.
     const bool flip = bgfx::getCaps()->originBottomLeft;
@@ -393,7 +423,9 @@ inline void runLumelBakeSelfTest(LumelBakeGPU &g, ShadowMapCache &sc,
             for (int ch = 0; ch < 3; ++ch) {
                 const float cv = std::min(1.0f, std::max(0.0f, cf[ch]));
                 const int cpu8 = static_cast<int>(cv * 255.0f + 0.5f);
-                const int gpu8 = pixels[gi + ch];
+                const float gv = std::min(1.0f, std::max(0.0f,
+                    halfToFloat(pixels[gi + ch])));
+                const int gpu8 = static_cast<int>(gv * 255.0f + 0.5f);
                 const int d = std::abs(cpu8 - gpu8);
                 sumAbs += d;
                 maxD = std::max(maxD, d);

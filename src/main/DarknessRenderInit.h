@@ -1208,6 +1208,27 @@ static bool createGPUResources(const Darkness::MissionData &mission,
                              blendedPolys);
             }
 
+            // The atlas is RGBA16F now (see HdrAtlasTexture for why). Every
+            // backend this targets supports it as a filtered 2D texture, but
+            // "supports it" is a claim the caps bits can settle, and a silent
+            // emulated path would show up as a mysterious performance cliff
+            // rather than an error.
+            {
+                const uint16_t fmt = bgfx::getCaps()
+                    ->formats[bgfx::TextureFormat::RGBA16F];
+                if (!(fmt & BGFX_CAPS_FORMAT_TEXTURE_2D))
+                    std::fprintf(stderr,
+                        "[FALLBACK] RGBA16F is not natively supported as a 2D "
+                        "texture on this backend (caps 0x%04x) — the lightmap "
+                        "atlas will run through bgfx emulation. Expect a "
+                        "performance cliff, not a visual one.\n", fmt);
+                else if (fmt & BGFX_CAPS_FORMAT_TEXTURE_2D_EMULATED)
+                    std::fprintf(stderr,
+                        "[FALLBACK] RGBA16F 2D textures are EMULATED on this "
+                        "backend (caps 0x%04x) — the lightmap atlas still "
+                        "works, but not at native cost.\n", fmt);
+            }
+
             for (const auto &atlas : gpu.lmAtlasSet.atlases) {
                 // Create texture WITHOUT initial data so it stays mutable —
                 // bgfx treats textures with initial mem as immutable.
@@ -1217,11 +1238,12 @@ static bool createGPUResources(const Darkness::MissionData &mission,
                 bgfx::TextureHandle th = bgfx::createTexture2D(
                     static_cast<uint16_t>(atlas.size),
                     static_cast<uint16_t>(atlas.size),
-                    false, 1, bgfx::TextureFormat::RGBA8,
+                    false, 1, bgfx::TextureFormat::RGBA16F,
                     BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP);
                 // Upload initial atlas data
-                const bgfx::Memory *mem = bgfx::copy(atlas.rgba.data(),
-                    static_cast<uint32_t>(atlas.rgba.size()));
+                const bgfx::Memory *mem = bgfx::copy(atlas.texels.data(),
+                    static_cast<uint32_t>(atlas.texels.size()
+                                          * sizeof(uint16_t)));
                 bgfx::updateTexture2D(th, 0, 0, 0, 0,
                     static_cast<uint16_t>(atlas.size),
                     static_cast<uint16_t>(atlas.size), mem);
@@ -1315,7 +1337,7 @@ static bool createGPUResources(const Darkness::MissionData &mission,
                 // a texture swap.
                 const Darkness::LightmapAtlasSet placement =
                     Darkness::scaleAtlasPlacement(gpu.lmAtlasSet, bf.density);
-                Darkness::AtlasTexture ours = placement.atlases[0];
+                Darkness::HdrAtlasTexture ours = placement.atlases[0];
 
                 // Disk cache: keyed on mission CONTENT + every bake parameter
                 // + the formula version. A hit skips the bake entirely; a
@@ -1370,7 +1392,8 @@ static bool createGPUResources(const Darkness::MissionData &mission,
                         "%.2f, %dx%d receiver supersampling, %d bounce rays, "
                         "AO %.2f...\n",
                         whyMiss.c_str(), bf.density, ours.size, ours.size,
-                        ours.rgba.size() / 1048576.0, bf.penumbraSamples,
+                        ours.texels.size() * sizeof(uint16_t) / 1048576.0,
+                        bf.penumbraSamples,
                         bf.emitterRadius, bf.supersample, bf.supersample,
                         cfg.rebakeBounce, cfg.rebakeAO);
                     // Mean texture colour per WR texture index — the albedo
@@ -1401,7 +1424,10 @@ static bool createGPUResources(const Darkness::MissionData &mission,
                     // The dominant-direction layer bakes alongside for the
                     // specular term; it rides the same passes at ~zero cost.
                     dirAtlas.size = ours.size;
-                    dirAtlas.rgba.assign(ours.rgba.size(), 0);
+                    // Components, not bytes: the direction atlas is RGBA8 and
+                    // `ours` is now RGBA16F, so their byte counts differ by 2x
+                    // while their texel counts match.
+                    dirAtlas.rgba.assign(ours.texels.size(), 0);
                     Darkness::bakeAtlasWithOverlays(
                         mission.wrData, mission.renderParams, bf, placement,
                         ours, animPolys, bs, 0,
@@ -1461,10 +1487,11 @@ static bool createGPUResources(const Darkness::MissionData &mission,
                 bgfx::TextureHandle rh = bgfx::createTexture2D(
                     static_cast<uint16_t>(ours.size),
                     static_cast<uint16_t>(ours.size),
-                    false, 1, bgfx::TextureFormat::RGBA8,
+                    false, 1, bgfx::TextureFormat::RGBA16F,
                     BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP);
-                const bgfx::Memory *rmem = bgfx::copy(ours.rgba.data(),
-                    static_cast<uint32_t>(ours.rgba.size()));
+                const bgfx::Memory *rmem = bgfx::copy(ours.texels.data(),
+                    static_cast<uint32_t>(ours.texels.size()
+                                          * sizeof(uint16_t)));
                 bgfx::updateTexture2D(rh, 0, 0, 0, 0,
                     static_cast<uint16_t>(ours.size),
                     static_cast<uint16_t>(ours.size), rmem);
@@ -1473,18 +1500,29 @@ static bool createGPUResources(const Darkness::MissionData &mission,
                 // "the swap never happened" are the same picture; only a number
                 // separates them.
                 if (bf.density == 1) {
-                    const auto &shipped = gpu.lmAtlasSet.atlases[0].rgba;
+                    const auto &shipped = gpu.lmAtlasSet.atlases[0].texels;
                     uint64_t differing = 0, counted = 0;
                     double sumOurs = 0.0, sumShipped = 0.0;
+                    // Still reported in /255 so the number stays comparable
+                    // with every measurement taken before the atlas went
+                    // half-float — the UNIT is unchanged, only the precision.
                     for (size_t k = 0; k + 3 < shipped.size() &&
-                                       k + 3 < ours.rgba.size(); k += 4) {
-                        // Alpha is 255 everywhere; compare colour only.
-                        const int d = std::abs(int(ours.rgba[k]) - int(shipped[k]))
-                                    + std::abs(int(ours.rgba[k+1]) - int(shipped[k+1]))
-                                    + std::abs(int(ours.rgba[k+2]) - int(shipped[k+2]));
-                        if (d > 0) ++differing;
-                        sumOurs    += (ours.rgba[k] + ours.rgba[k+1] + ours.rgba[k+2]) / 3.0;
-                        sumShipped += (shipped[k] + shipped[k+1] + shipped[k+2]) / 3.0;
+                                       k + 3 < ours.texels.size(); k += 4) {
+                        // Alpha is 1.0 everywhere; compare colour only.
+                        double o[3], sh[3];
+                        for (int c = 0; c < 3; ++c) {
+                            o[c]  = Darkness::halfToFloat(ours.texels[k + c]) * 255.0;
+                            sh[c] = Darkness::halfToFloat(shipped[k + c]) * 255.0;
+                        }
+                        // A half-float re-bake almost never lands EXACTLY on a
+                        // shipped 8-bit value, so "differs" needs a threshold
+                        // or it reads 100% always and stops being a signal.
+                        const double d = std::abs(o[0] - sh[0])
+                                       + std::abs(o[1] - sh[1])
+                                       + std::abs(o[2] - sh[2]);
+                        if (d > 0.5) ++differing;
+                        sumOurs    += (o[0] + o[1] + o[2]) / 3.0;
+                        sumShipped += (sh[0] + sh[1] + sh[2]) / 3.0;
                         ++counted;
                     }
                     std::fprintf(stderr,
@@ -1586,7 +1624,7 @@ static bool createGPUResources(const Darkness::MissionData &mission,
                     std::vector<std::pair<float, float>> shadowDeltas;
                     double wSum = 0.0, wrSum = 0.0;
                     size_t skippedDark = 0, skippedAnim = 0;
-                    auto polyMean = [](const Darkness::AtlasTexture &at,
+                    auto polyMean = [](const Darkness::HdrAtlasTexture &at,
                                        const Darkness::LmapEntry &e) {
                         double sum = 0.0;
                         size_t n = 0;
@@ -1596,10 +1634,12 @@ static bool createGPUResources(const Darkness::MissionData &mission,
                             for (int x = 0; x < e.pixelW; ++x) {
                                 const size_t px =
                                     (row + e.pixelX + x) * 4;
-                                if (px + 2 >= at.rgba.size()) continue;
-                                sum += 0.2126 * at.rgba[px] +
-                                       0.7152 * at.rgba[px + 1] +
-                                       0.0722 * at.rgba[px + 2];
+                                if (px + 2 >= at.texels.size()) continue;
+                                // /255 units, as above.
+                                sum += (0.2126 * Darkness::halfToFloat(at.texels[px])
+                                      + 0.7152 * Darkness::halfToFloat(at.texels[px + 1])
+                                      + 0.0722 * Darkness::halfToFloat(at.texels[px + 2]))
+                                     * 255.0;
                                 ++n;
                             }
                         }

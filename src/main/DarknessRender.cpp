@@ -838,13 +838,13 @@ static void renderWorld(
                             lp[i][2] = L.pos.z; lp[i][3] = L.reach2;
                             lc[i][0] = L.colorK.x; lc[i][1] = L.colorK.y;
                             lc[i][2] = L.colorK.z;
-                            // S4c differential lights pack BOTH slots:
-                            // 100 + frozen·16 + current (slots < 16 by
-                            // pool construction) — decoded in
-                            // live_lights.sh.
+                            // S4c differential lights pack BOTH slots into
+                            // the one float — see LiveLightPack.h, which
+                            // owns the radix and is mirrored by the decode
+                            // in live_lights.sh.
                             lc[i][3] = L.shadowSlotFrozen >= 0
-                                ? 100.0f + 16.0f * L.shadowSlotFrozen +
-                                      static_cast<float>(L.shadowSlot)
+                                ? Darkness::packLiveDiffSlots(
+                                      L.shadowSlotFrozen, L.shadowSlot)
                                 : static_cast<float>(L.shadowSlot);
                         }
                         bgfx::setUniform(gpu.u_liveLightPos, lp,
@@ -5722,13 +5722,15 @@ static void updateLightmaps(
         if (dirtyX1 > dirtyX0 && dirtyY1 > dirtyY0) {
             int dw = dirtyX1 - dirtyX0;
             int dh = dirtyY1 - dirtyY0;
-            std::vector<uint8_t> sub(dw * dh * 4);
+            std::vector<uint16_t> sub(static_cast<size_t>(dw) * dh * 4);
             for (int y = 0; y < dh; ++y) {
-                std::memcpy(&sub[y * dw * 4],
-                            &atlas.rgba[((dirtyY0 + y) * atlas.size + dirtyX0) * 4],
-                            dw * 4);
+                std::memcpy(&sub[static_cast<size_t>(y) * dw * 4],
+                            &atlas.texels[((static_cast<size_t>(dirtyY0) + y)
+                                           * atlas.size + dirtyX0) * 4],
+                            static_cast<size_t>(dw) * 4 * sizeof(uint16_t));
             }
-            const bgfx::Memory *mem = bgfx::copy(sub.data(), static_cast<uint32_t>(sub.size()));
+            const bgfx::Memory *mem = bgfx::copy(sub.data(),
+                static_cast<uint32_t>(sub.size() * sizeof(uint16_t)));
             bgfx::updateTexture2D(gpu.lightmapAtlasHandles[0], 0, 0,
                 static_cast<uint16_t>(dirtyX0), static_cast<uint16_t>(dirtyY0),
                 static_cast<uint16_t>(dw), static_cast<uint16_t>(dh), mem);
@@ -5749,6 +5751,20 @@ static void updateLightmaps(
     // everything anyway).
     std::vector<size_t> doorRecs;
     if (doorShadow) doorRecs.swap(doorShadow->readyRecs());
+
+    // [BLEND_TEAR] census — the "lightmap reloads layerwise" report.
+    // The atomic settle handoff governs when recs become VISIBLE
+    // (readyRecs), but a door event overwrites `rec.overlays[k]` one
+    // LIGHT at a time across many frames, and those buffers are the
+    // blend's source. So any OTHER blend reason (flicker, an envelope
+    // toggle) that touches a rec while its event is still in flight
+    // recomposites base + a MIX of pre- and post-event overlay layers.
+    // That is a torn read, and it is exactly what "loaded layerwise,
+    // flickering" looks like on screen. Count it rather than assume it.
+    std::unordered_set<size_t> midEventRecs;
+    if (doorShadow)
+        for (size_t r : doorShadow->pendingReady()) midEventRecs.insert(r);
+    size_t blendTears = 0;
 
     if (rebakedActive && !gpu.rebakedAnimPolys.empty() &&
         !gpu.rebakedAtlasSet.atlases.empty() &&
@@ -5774,16 +5790,21 @@ static void updateLightmaps(
             // uploads the whole atlas in one call.
             const bool fullBlend = forceReb || forceAll;
 
+            // Split so the fix targets the real half: the CPU weighted sum
+            // over base+overlays, or the per-rect texture upload. An
+            // aggregate would hide which one to move.
+            double blendMs = 0.0, uploadMs = 0.0;
             auto uploadRect = [&](int x0, int y0, int w, int h) {
                 if (w <= 0 || h <= 0) return;
-                std::vector<uint8_t> sub(static_cast<size_t>(w) * h * 4);
+                std::vector<uint16_t> sub(static_cast<size_t>(w) * h * 4);
                 for (int y = 0; y < h; ++y)
                     std::memcpy(&sub[static_cast<size_t>(y) * w * 4],
-                                &atlas.rgba[((static_cast<size_t>(y0) + y)
-                                             * atlas.size + x0) * 4],
-                                static_cast<size_t>(w) * 4);
+                                &atlas.texels[((static_cast<size_t>(y0) + y)
+                                               * atlas.size + x0) * 4],
+                                static_cast<size_t>(w) * 4 * sizeof(uint16_t));
                 const bgfx::Memory *mem = bgfx::copy(
-                    sub.data(), static_cast<uint32_t>(sub.size()));
+                    sub.data(),
+                    static_cast<uint32_t>(sub.size() * sizeof(uint16_t)));
                 bgfx::updateTexture2D(gpu.rebakedAtlasHandles[0], 0, 0,
                     static_cast<uint16_t>(x0), static_cast<uint16_t>(y0),
                     static_cast<uint16_t>(w), static_cast<uint16_t>(h), mem);
@@ -5792,6 +5813,9 @@ static void updateLightmaps(
             auto blendOne = [&](size_t idx, bool bypassVisibility) {
                 const auto &rec = gpu.rebakedAnimPolys[idx];
                 if (rec.ci >= gpu.rebakedAtlasSet.entries.size()) return;
+                // Torn read: this rec's overlay stack is mid-re-bake.
+                if (!midEventRecs.empty() && midEventRecs.count(idx))
+                    ++blendTears;
                 // Continuous flicker skips polygons nobody can see; they
                 // refresh within a tick or two of becoming visible because
                 // the signal never stops crossing the threshold. Full blends
@@ -5813,9 +5837,12 @@ static void updateLightmaps(
                 if (rec.pi < 0 ||
                     rec.pi >= static_cast<int32_t>(cellEntries.size())) return;
                 const auto &entry = cellEntries[rec.pi];
+                const auto tb0 = std::chrono::steady_clock::now();
                 Darkness::blendRebakedLightmap(
                     rec, entry, effIntensities, atlas, gpu.rebakedDensity,
                     flickerActive ? &flickerTints : nullptr);
+                blendMs += std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - tb0).count();
                 ++blends;
                 if (!fullBlend) {
                     const int x0 = std::max(0, entry.pixelX - pad);
@@ -5824,7 +5851,10 @@ static void updateLightmaps(
                                             entry.pixelX + rec.w + pad);
                     const int y1 = std::min(atlas.size,
                                             entry.pixelY + rec.h + pad);
+                    const auto tu0 = std::chrono::steady_clock::now();
                     uploadRect(x0, y0, x1 - x0, y1 - y0);
+                    uploadMs += std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() - tu0).count();
                 }
             };
 
@@ -5963,6 +5993,31 @@ static void updateLightmaps(
                 dirDirty.clear();
             }
 
+            // Torn-read report. Unconditional and cumulative: this is a
+            // CORRECTNESS counter, not a cost one, and a rate-limited
+            // aggregate already hid one door bug in this subsystem.
+            if (blendTears) {
+                static uint64_t sTearTotal = 0, sTearFrames = 0;
+                sTearTotal += blendTears;
+                ++sTearFrames;
+                static std::chrono::steady_clock::time_point sLastTear{};
+                const auto nowT = std::chrono::steady_clock::now();
+                if (std::chrono::duration<double>(nowT - sLastTear).count()
+                        >= 1.0) {
+                    sLastTear = nowT;
+                    std::fprintf(stderr,
+                        "[BLEND_TEAR] %zu rec(s) re-blended THIS frame while "
+                        "their door event is still re-baking their overlay "
+                        "stack (cumulative %llu over %llu frames) — the "
+                        "blend composited a mix of pre- and post-event "
+                        "layers. This is the 'lightmap reloads layerwise' "
+                        "artifact.\n",
+                        blendTears,
+                        static_cast<unsigned long long>(sTearTotal),
+                        static_cast<unsigned long long>(sTearFrames));
+                }
+            }
+
             // The density² cost measurement. First event prints immediately
             // (a path that never logs and a path that never runs look the
             // same); afterwards at most one line per second, wall-clock.
@@ -5979,8 +6034,9 @@ static void updateLightmaps(
                     std::chrono::duration<double>(now - lastLog).count() >= 1.0) {
                     std::fprintf(stderr,
                         "[REBAKE_BLEND] %zu polys blended+uploaded in %.2f ms "
-                        "this event (worst %.2f ms over %llu events)%s\n",
-                        blends, ms, worstMs,
+                        "(blend %.2f + upload %.2f) this event "
+                        "(worst %.2f ms over %llu events)%s\n",
+                        blends, ms, blendMs, uploadMs, worstMs,
                         static_cast<unsigned long long>(events),
                         fullBlend ? " [full atlas]" : "");
                     lastLog = now;
@@ -8036,6 +8092,16 @@ int main(int argc, char *argv[]) {
             doorShadow.runDiffDiagnostic(gpu.shadowCache,
                                          cfg.doorDiffDiag,
                                          &gpu.lumelBake);
+
+        // S4c trajectory harness: --door-swing-diag <objID> sweeps the
+        // swing and pushes the promoted lights through the real uniform
+        // transport, so pose-dependent and slot-encoding faults surface
+        // as a per-step error curve (see DoorShadowSystem).
+        if (cfg.doorSwingDiag != 0)
+            doorShadow.runSwingDiagnostic(gpu.shadowCache,
+                                          cfg.doorSwingDiag,
+                                          cfg.doorSwingSteps,
+                                          &gpu.lumelBake);
     }
 
     // ── S1 acceptance: shadow-map vs raycastWorld cross-check ──
@@ -8351,6 +8417,47 @@ int main(int argc, char *argv[]) {
         state.spawnYaw = cfg.spawnOverrideYaw;
         state.cam.init(state.spawnX, state.spawnY, state.spawnZ);
         state.cam.yaw = state.spawnYaw;
+    }
+
+    // DEV-ONLY --spawn-at-door <objID>: park the camera a few feet from a
+    // named door, facing it. --spawn-override does this already but needs
+    // coordinates nobody has to hand, so verifying a door swing meant
+    // walking across the map every run. Resolved from P$Position, so it
+    // needs no collision/render state and works for any door id the
+    // [DOOR_CENSUS] line names.
+    if (cfg.spawnAtDoor != 0) {
+        auto propSvc = GET_SERVICE(Darkness::PropertyService);
+        Darkness::Vector3 dpos(0.0f);
+        bool found = false;
+        if (propSvc) {
+            Darkness::Variant v;
+            if (propSvc->get(cfg.spawnAtDoor, "Position", "position", v)) {
+                dpos = v.toVector();
+                found = true;
+            }
+        }
+        if (!found) {
+            std::fprintf(stderr,
+                "[FALLBACK] --spawn-at-door %d: no P$Position for that "
+                "object — spawn left at the mission marker.\n",
+                cfg.spawnAtDoor);
+        } else {
+            // Stand back along -Y and a little up; face the door. Yaw is
+            // measured the same way the camera reports it.
+            const float back = 8.0f;
+            state.spawnX = dpos.x;
+            state.spawnY = dpos.y - back;
+            state.spawnZ = dpos.z + 2.0f;
+            state.spawnYaw = 90.0f;   // +Y, i.e. toward the door
+            state.cam.init(state.spawnX, state.spawnY, state.spawnZ);
+            state.cam.yaw = state.spawnYaw;
+            std::fprintf(stderr,
+                "[SPAWN_OVERRIDE] DEV: --spawn-at-door %d — camera parked "
+                "at (%.1f, %.1f, %.1f) yaw=%.1f, %.1f ft from the door at "
+                "(%.1f, %.1f, %.1f)\n",
+                cfg.spawnAtDoor, state.spawnX, state.spawnY, state.spawnZ,
+                state.spawnYaw, back, dpos.x, dpos.y, dpos.z);
+        }
     }
 
     // Initialize physics player at spawn position.
@@ -9222,6 +9329,64 @@ int main(int argc, char *argv[]) {
 
             // Debug console overlay (draws on top of frob hint when open)
             dbgConsole.render();
+
+            // ── [SHADOW_LOAD]: the S1 draw cost, per frame ──
+            //
+            // `lightRenders` was counted and never reported, which is how the
+            // pipeline review's "≤24 renders/frame ≈ 780k tris/frame — FINE
+            // today" verdict could go stale without anyone noticing: that
+            // number was measured when the live-light cap was 4, and every
+            // promoted light re-renders SIX faces of the full caster mesh on
+            // any frame its casterHash moves. A swinging door moves the hash
+            // for every light whose reach contains it, so the per-frame draw
+            // load scales with (promoted lights x 6), not with the cap.
+            //
+            // Reported only while it is actually happening (renders > 0) and
+            // rate-limited, so a still scene stays silent.
+            {
+                static uint32_t prevRenders = 0;
+                static uint32_t peakPerFrame = 0;
+                static uint64_t sumRenders = 0;
+                static double   accMs = 0.0;
+                static uint32_t accFrames = 0;
+                static auto     lastReport = std::chrono::steady_clock::now();
+                static auto     prevFrameAt = std::chrono::steady_clock::now();
+
+                const auto nowT = std::chrono::steady_clock::now();
+                const double frameMs = std::chrono::duration<double, std::milli>(
+                    nowT - prevFrameAt).count();
+                prevFrameAt = nowT;
+
+                const uint32_t renders =
+                    gpu.shadowCache.lightRenders >= prevRenders
+                        ? gpu.shadowCache.lightRenders - prevRenders : 0;
+                prevRenders = gpu.shadowCache.lightRenders;
+                peakPerFrame = std::max(peakPerFrame, renders);
+                sumRenders += renders;
+                accMs += frameMs;
+                ++accFrames;
+
+                if (peakPerFrame > 0 &&
+                    std::chrono::duration<float>(nowT - lastReport).count()
+                        >= 1.0f) {
+                    lastReport = nowT;
+                    const uint32_t tris = gpu.shadowCache.casterIndexCount / 3;
+                    std::fprintf(stderr,
+                        "[SHADOW_LOAD] %.1f mean / %u peak light "
+                        "re-renders/frame "
+                        "(x6 faces; full-mesh upper bound %u tris/face = "
+                        "%.2fM tris in one frame, before per-cell range "
+                        "culling); frame time mean %.1f ms over %u frames\n",
+                        accFrames ? double(sumRenders) / accFrames : 0.0,
+                        peakPerFrame, tris,
+                        peakPerFrame * 6.0 * tris / 1e6,
+                        accFrames ? accMs / accFrames : 0.0, accFrames);
+                    peakPerFrame = 0;
+                    sumRenders = 0;
+                    accMs = 0.0;
+                    accFrames = 0;
+                }
+            }
 
             state.bgfxFrame = bgfx::frame();
 

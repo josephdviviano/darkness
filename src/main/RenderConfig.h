@@ -829,19 +829,42 @@ struct RenderConfig {
     // truth over its cone polys; histograms + panel images under
     // doorshadow_diag/. 0 = off.
     int  doorDiffDiag         = 0;
+    // --door-swing-diag <objID> [--door-swing-steps N]: the TRAJECTORY
+    // harness. Same comparison as --door-diff-diag but swept across the
+    // swing instead of sampled at one pose, and with the promoted lights
+    // pushed through the REAL uniform transport (pack -> decode) rather
+    // than handed straight to the lookup. Catches pose-dependent faults
+    // (visible as a hump in the per-step curve) and slot-encoding faults,
+    // neither of which a single-pose, transport-free sample can see.
+    // 0 = off.
+    int  doorSwingDiag        = 0;
+    int  doorSwingSteps       = 8;
     // --lumel-bake-test: the S2 GPU engine's acceptance — GPU-bake one
     // door overlay and diff it against the CPU bake of the same rect.
     bool lumelBakeTest        = false;
-    // Door-event re-bake path. CPU (the default) runs the exact load
-    // formula's ray path — measured drift-free against the stored load
-    // overlays, where the GPU path missed thin/grazing WORLD occluders
-    // (sub-texel silhouettes in the 256^2 faces; --door-diff-diag
-    // classes gpuMissedOccluder=148/gpuPhantomShadow=171 on door 403).
-    // Event latency is hidden: the S4c differential carries the door
-    // shadow until the event drains, so the CPU trickle is invisible.
-    // --rebake-gpu-events re-enables the GPU engine (kept for the
-    // --lumel-bake-test acceptance and the diagnostic harness).
-    bool rebakeCpuEvents      = true;
+    // Door-event re-bake path. GPU is the default since 2026-08-08.
+    //
+    // It was parked in favour of the CPU ray path because the GPU bake
+    // missed thin/grazing WORLD occluders and grew grazing acne
+    // (gpuMissedOccluder=148 / gpuPhantomShadow=171 on door 403). Both
+    // causes were found and fixed rather than worked around:
+    //   * every PCF tap was compared against the CENTRE fragment's
+    //     distance, so a grazing receiver self-shadowed at the kernel
+    //     edges. Taps are now depth-referenced to where their own ray
+    //     meets the receiver plane — exact, because WR polygons are
+    //     planar. Measured on door 407: phantom 341 -> 15.
+    //   * the depth bias was a flat half world unit, which is thicker
+    //     than a door leaf and was swallowing occluders whole. It is now
+    //     distance-proportional, because a face texel subtends a fixed
+    //     ANGLE. Measured: gross error 193 -> 77, and balanced (39
+    //     phantom / 38 missed) instead of lopsided.
+    // The bake target is RGBA16F like the rest of the pipeline, so the
+    // path no longer quantises what it writes.
+    //
+    // The CPU ray path remains as --rebake-cpu-events: it is still the
+    // arbiter the diagnostics measure against, and the fallback if a
+    // backend's readback misbehaves.
+    bool rebakeCpuEvents      = false;
     // DEV-ONLY --stress-frob-obj "a,b": send FrobWorldEnd to exactly these
     // object IDs every ~3 s (5 s warmup) through ScriptManager — the same
     // message FrobSystem::executeFrob sends, so lever→ControlDevice→script
@@ -960,6 +983,11 @@ struct RenderConfig {
     // need the listener parked in a SPECIFIC room; nothing ships a
     // teleport. Applied loudly ([SPAWN_OVERRIDE] banner) right after
     // initRuntimeState in DarknessRender.cpp. Never ship-enabled.
+    // --spawn-at-door <objID> (DEV-ONLY): park the camera a few feet from
+    // that door, facing it. Same purpose as --spawn-override but without
+    // needing coordinates — verifying a door swing otherwise meant walking
+    // across the map on every run. 0 = off.
+    int         spawnAtDoor         = 0;          // --spawn-at-door <objID>
     bool        spawnOverride       = false;      // --spawn-override "x,y,z[,yaw]"
     float       spawnOverrideX      = 0.0f;
     float       spawnOverrideY      = 0.0f;
@@ -2698,6 +2726,16 @@ inline CliResult applyCliOverrides(int argc, char* argv[], RenderConfig& cfg) {
         } else if (std::strcmp(argv[i], "--door-diff-diag") == 0 &&
                    i + 1 < argc) {
             cfg.doorDiffDiag = std::atoi(argv[++i]);
+        } else if (std::strcmp(argv[i], "--spawn-at-door") == 0 &&
+                   i + 1 < argc) {
+            cfg.spawnAtDoor = std::atoi(argv[++i]);
+        } else if (std::strcmp(argv[i], "--door-swing-diag") == 0 &&
+                   i + 1 < argc) {
+            cfg.doorSwingDiag = std::atoi(argv[++i]);
+        } else if (std::strcmp(argv[i], "--door-swing-steps") == 0 &&
+                   i + 1 < argc) {
+            cfg.doorSwingSteps = std::min(32, std::max(2,
+                std::atoi(argv[++i])));
         } else if (std::strcmp(argv[i], "--lumel-bake-test") == 0) {
             cfg.lumelBakeTest = true;
         } else if (std::strcmp(argv[i], "--rebake-cpu-events") == 0) {

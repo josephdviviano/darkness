@@ -41,6 +41,7 @@
 
 #include "LightmapBake.h"
 #include "LumelBakeGPU.h"
+#include "LiveLightPack.h"   // kLiveLightCap + the S4c slot transport
 #include "../services/physics/ObjectCollisionGeometry.h"
 
 #include <algorithm>
@@ -475,6 +476,14 @@ public:
     // visibility filter bypassed.
     std::vector<size_t> &readyRecs() { return mReadyRecs; }
 
+    // Recs whose overlay buffers a door event is CURRENTLY re-baking —
+    // held back from readyRecs() by the atomic settle handoff, but the
+    // buffers themselves are already being overwritten light-by-light.
+    // Anything that re-blends one of these mid-event composites a MIX of
+    // pre- and post-event overlay layers. Exposed so the blend path can
+    // count that (see the [BLEND_TEAR] census in DarknessRender.cpp).
+    const std::vector<size_t> &pendingReady() const { return mPendingReady; }
+
     // Recs whose DIRECTION texels were re-encoded this frame — the
     // renderer uploads their rects from the CPU dir atlas.
     std::vector<size_t> &dirDirtyRecs() { return mDirDirty; }
@@ -541,16 +550,19 @@ public:
                     continue;
                 }
                 RebakedAnimPoly &rec = (*mAnimPolys)[it.recIdx];
-                std::vector<uint8_t> &buf = rec.overlays[it.ovK];
+                std::vector<uint16_t> &buf = rec.overlays[it.ovK];
                 if (static_cast<int>(buf.size()) < it.w * it.h * 3)
                     buf.assign(static_cast<size_t>(it.w) * it.h * 3, 0);
+                // Half in, half out — the GPU target is RGBA16F like the
+                // atlas and the blend store, so the readback is a straight
+                // channel copy with no quantisation anywhere in the path.
                 for (int y = 0; y < it.h; ++y) {
                     const int sy = it.y + y;
                     const int row = flip ? (S - 1 - sy) : sy;
-                    const uint8_t *src =
+                    const uint16_t *src =
                         &gpu->batch.pixels[(static_cast<size_t>(row) * S +
                                             it.x) * 4];
-                    uint8_t *dst =
+                    uint16_t *dst =
                         &buf[static_cast<size_t>(y) * it.w * 3];
                     for (int x = 0; x < it.w; ++x) {
                         dst[x * 3 + 0] = src[x * 4 + 0];
@@ -831,15 +843,18 @@ public:
                         if (rec.overlayLightIdx[k] == lightIdx) break;
                     const WRStaticLight &L =
                         mWr->staticLights[static_cast<size_t>(lightIdx)];
-                    const bool spot = (L.inner != -1.0f);
                     const LumelGrid grid =
                         buildLumelGrid(*mWr, rec.ci, rec.pi, mDensity);
                     const bool gridOk = grid.valid &&
                                         grid.lx == rec.w &&
                                         grid.ly == rec.h &&
                                         k < rec.overlays.size();
-                    if (spot || !gridOk) {
-                        // CPU fallback for this item.
+                    if (!gridOk) {
+                        // CPU fallback for this item. Spot lights used to
+                        // land here too — the bake shader is cone-aware now
+                        // (u_bakeSpot), so the only fallback left is a
+                        // polygon whose lumel grid disagrees with its stored
+                        // rect, which is a data problem, not a path choice.
                         ++mWorkCursor;
                         rebakeOverlay(recIdx, lightIdx);
                         if (mEventDirDone.insert(recIdx).second)
@@ -879,7 +894,8 @@ public:
                                          mFormula.surfaceOffset, L.loc,
                                          reach, colorK, slot,
                                          mFormula.emitterRadius, shelfX,
-                                         shelfY))
+                                         shelfY, /*pcssEmitter=*/-1.0f,
+                                         L.dir, L.inner, L.outer))
                         break;   // transient pool exhausted this frame
                     LumelBakeBatch::Item item;
                     item.recIdx = recIdx;
@@ -1222,26 +1238,34 @@ public:
                                 hardVis(ld.slotA, L.loc, ld.reach, P);
                             live = hlFall * dv;
                         }
-                        const uint8_t *ovA8 = &rec.overlays[k][t * 3];
+                        const uint16_t *ovA8 = &rec.overlays[k][t * 3];
                         float texErr = 0.0f, selfErr = 0.0f;
                         float visA = 0.0f, visB = 0.0f;
                         for (int ch = 0; ch < 3; ++ch) {
-                            const float baked = ovA8[ch] / 255.0f;
+                            const float baked = halfToFloat(ovA8[ch]);
                             const float screen = std::max(
                                 0.0f, baked + ld.colorK[ch] * live);
-                            const float truth = std::min(
-                                1.0f, std::max(0.0f, truthB[t][ch]));
-                            pd.a[t * 3 + ch] = ovA8[ch];
+                            // HDR-vs-HDR. The lightmap container is
+                            // RGBA16F and 65k texels carry values ABOVE
+                            // 1.0, so clamping the truth while leaving
+                            // `screen` unclamped invented an error of
+                            // (value - 1.0) on every one of them — which
+                            // is where this harness's old 746/255 max
+                            // came from. Clamp for DISPLAY only.
+                            const float truth =
+                                std::max(0.0f, truthB[t][ch]);
+                            pd.a[t * 3 + ch] = static_cast<uint8_t>(
+                                std::min(1.0f, baked) * 255.0f);
                             pd.sMid[t * 3 + ch] = static_cast<uint8_t>(
                                 std::min(1.0f, screen) * 255.0f);
                             pd.b[t * 3 + ch] = static_cast<uint8_t>(
-                                truth * 255.0f);
+                                std::min(1.0f, truth) * 255.0f);
                             texErr = std::max(texErr,
                                               std::abs(screen - truth));
                             selfErr = std::max(
                                 selfErr,
-                                std::abs(baked - std::min(1.0f,
-                                    std::max(0.0f, truthA[t][ch]))));
+                                std::abs(baked -
+                                    std::max(0.0f, truthA[t][ch])));
                             const float un = ld.colorK[ch] * hlFall;
                             if (un > 1e-4f) {
                                 visA = std::max(visA,
@@ -1436,8 +1460,19 @@ public:
                 const bool flip = bgfx::getCaps()->originBottomLeft;
                 for (const GpuItem &it : batch) {
                     const RebakedAnimPoly &rec = (*mAnimPolys)[it.recIdx];
-                    const std::vector<uint8_t> &stored =
+                    const std::vector<uint16_t> &stored =
                         rec.overlays[it.ovK];
+                    // This diagnostic leg compares against an RGBA8 GPU
+                    // readback and every threshold in it is calibrated in
+                    // /255 counts, so quantise the (now half-float) stored
+                    // overlay into the same units rather than rescaling a
+                    // dozen thresholds and losing comparability with the
+                    // numbers already recorded in the plan.
+                    std::vector<uint8_t> stored8(stored.size());
+                    for (size_t q = 0; q < stored.size(); ++q)
+                        stored8[q] = static_cast<uint8_t>(std::lround(
+                            std::min(1.0f, std::max(0.0f,
+                                halfToFloat(stored[q]))) * 255.0f));
                     const LumelGrid cgrid = buildLumelGrid(
                         *mWr, rec.ci, rec.pi, mDensity);
                     const WRStaticLight &cL = mWr->staticLights[
@@ -1451,12 +1486,17 @@ public:
                     for (int y = 0; y < it.h; ++y) {
                         const int sy = it.y + y;
                         const int row = flip ? (S - 1 - sy) : sy;
-                        const uint8_t *src = &gpu->batch.pixels[
+                        const uint16_t *src = &gpu->batch.pixels[
                             (static_cast<size_t>(row) * S + it.x) * 4];
                         for (int x = 0; x < it.w; ++x) {
                             float texErr = 0.0f;
                             for (int ch = 0; ch < 3; ++ch) {
-                                const uint8_t g8 = src[x * 4 + ch];
+                                // /255 counts: this harness's thresholds and
+                                // every number recorded from it are in them.
+                                const uint8_t g8 = static_cast<uint8_t>(
+                                    std::lround(std::min(1.0f, std::max(0.0f,
+                                        halfToFloat(src[x * 4 + ch])))
+                                        * 255.0f));
                                 const uint8_t s8 =
                                     stored8[(static_cast<size_t>(y) *
                                              it.w + x) * 3 + ch];
@@ -1619,6 +1659,666 @@ public:
         }
     }
 
+    // ── S4c TRAJECTORY harness (--door-swing-diag <doorID>) ─────────────
+    // `--door-diff-diag` samples ONE synthetic pose and calls the shadow
+    // lookups with the C++ slot integers directly. That makes it blind to
+    // two whole classes of mid-swing defect, which is why the user can see
+    // a correct lightmap at both ENDS of a swing and an artefactual one
+    // throughout the middle:
+    //
+    //   1. Anything pose-DEPENDENT. A single sample cannot tell a defect
+    //      that peaks mid-travel from one that is uniformly small. This
+    //      harness sweeps the swing and prints the error as a CURVE, so
+    //      the shape of the fault is the primary readout.
+    //   2. Anything in the TRANSPORT. The screen does not receive slot
+    //      integers; it receives one float per light, packed by
+    //      DarknessRender.cpp and decoded by live_lights.sh. A harness
+    //      that skips that round-trip cannot see an encoding fault at all
+    //      -- and an encoding fault is invisible at rest by construction,
+    //      because a settled door has no differential term.
+    //
+    // So this harness pushes every promoted light through the REAL
+    // transport (packLiveDiffSlots -> unpackLiveDiffSlots) and does its
+    // lookups with the DECODED slots, exactly as the GPU would. It also
+    // applies the shader's cap truncation and reach cutoff, so a light
+    // silently dropped by kLiveLightCap shows up as error rather than as
+    // nothing.
+    //
+    // Per step it reports mean/p95/max |screen - settled truth| and the
+    // share of texels past 8/255, and writes panels for the worst step.
+    void runSwingDiagnostic(ShadowMapCache &sc, int32_t doorID, int steps,
+                            LumelBakeGPU * = nullptr) {
+        if (!active() || !sc.valid() || !mOcclusion.world) {
+            std::fprintf(stderr, "[SWING_DIAG] inactive or no cache\n");
+            return;
+        }
+        const DoorShadowDoor *d = nullptr;
+        for (const auto &dd : mDoors)
+            if (dd.objID == doorID) { d = &dd; break; }
+        auto lw = mDoorWork.find(doorID);
+        if (!d || lw == mDoorWork.end() || lw->second.empty()) {
+            std::fprintf(stderr,
+                "[SWING_DIAG] door %d unknown or has no cone work\n",
+                doorID);
+            return;
+        }
+        const auto &bodies = mOcclusion.world->getBodies();
+        if (d->bodyIdx >= bodies.size()) return;
+        const ObjectCollisionBody &db = bodies[d->bodyIdx];
+        steps = std::max(2, std::min(32, steps));
+
+        // Hinge + swing axis, same construction as runDiffDiagnostic: the
+        // vertical local axis is the hinge direction, the wider remaining
+        // horizontal axis is the leaf width, hinge on its negative edge.
+        int vAx = 0; float vBest = -1.0f;
+        for (int i = 0; i < 3; ++i) {
+            const float az = std::abs(db.rotation[i].z);
+            if (az > vBest) { vBest = az; vAx = i; }
+        }
+        int wAx = -1;
+        for (int i = 0; i < 3; ++i) {
+            if (i == vAx) continue;
+            if (wAx < 0 || db.edgeLengths[i] > db.edgeLengths[wAx]) wAx = i;
+        }
+        const Vector3 hinge =
+            db.worldPos - Vector3(db.rotation[wAx]) *
+                              (db.edgeLengths[wAx] * 0.5f);
+
+        // Occlusion arbiter with the moved leaf as an explicit OBB (the
+        // settled CPU truth at an arbitrary pose).
+        struct SwingOcc {
+            const DoorSegmentOcclusion *base;
+            uint32_t skipBody;
+            Vector3 pos, he;
+            glm::mat3 rot;
+            static bool blocked(const void *ctxRaw, const Vector3 &a,
+                                const Vector3 &b) {
+                const auto *c = static_cast<const SwingOcc *>(ctxRaw);
+                const Vector3 ro = glm::transpose(c->rot) * (a - c->pos);
+                const Vector3 rd = glm::transpose(c->rot) * (b - a);
+                float t0 = 0.0f, t1 = 1.0f;
+                bool hit = true;
+                for (int i = 0; i < 3 && hit; ++i) {
+                    if (std::abs(rd[i]) < 1e-9f) {
+                        if (std::abs(ro[i]) > c->he[i]) hit = false;
+                    } else {
+                        float ta = (-c->he[i] - ro[i]) / rd[i];
+                        float tb = (c->he[i] - ro[i]) / rd[i];
+                        if (ta > tb) std::swap(ta, tb);
+                        t0 = std::max(t0, ta);
+                        t1 = std::min(t1, tb);
+                        if (t0 > t1) hit = false;
+                    }
+                }
+                if (hit) return true;
+                if (c->base && c->base->world)
+                    for (uint32_t bi : c->base->bodies)
+                        if (bi != c->skipBody &&
+                            c->base->world->segmentHitsBody(a, b, bi))
+                            return true;
+                return false;
+            }
+        };
+
+        // The door's promotable lights, ranked exactly as update() ranks
+        // them, so the cap truncation below drops the same ones the
+        // renderer would drop.
+        struct SwingLight {
+            int16_t li;
+            Vector3 colorK;
+            float reach, intensity;
+            int slotFrozen = -1;
+        };
+        std::vector<SwingLight> sls;
+        {
+            std::vector<int16_t> lights;
+            for (const auto &pr : lw->second)
+                if (std::find(lights.begin(), lights.end(), pr.second) ==
+                    lights.end())
+                    lights.push_back(pr.second);
+            for (int16_t li : lights) {
+                const WRStaticLight &L =
+                    mWr->staticLights[static_cast<size_t>(li)];
+                if (L.inner != -1.0f) continue;   // spots never promote
+                const float reach =
+                    static_cast<size_t>(li) < mReach.size()
+                        ? mReach[static_cast<size_t>(li)] : 0.0f;
+                if (reach <= 0.0f) continue;
+                SwingLight s;
+                s.li = li;
+                s.reach = reach;
+                s.colorK =
+                    L.bright * (mFormula.brightScale * promoteK(li));
+                s.intensity = doorIntensity(li, *d);
+                sls.push_back(s);
+            }
+            std::sort(sls.begin(), sls.end(),
+                      [](const SwingLight &a, const SwingLight &b) {
+                          return a.intensity > b.intensity;
+                      });
+        }
+        if (sls.empty()) {
+            std::fprintf(stderr,
+                "[SWING_DIAG] door %d: no promotable omni lights\n",
+                doorID);
+            return;
+        }
+
+        // Frozen references at the BAKED pose — acquired first, exactly as
+        // promoteOne does, so the slots they land on are the real ones.
+        const auto ovBaked = bakedPoseOverrides();
+        int nextId = -9200;
+        size_t promoted = 0;
+        for (SwingLight &s : sls) {
+            if (promoted >= kPromoteCap) break;
+            // Two slots per differential (frozen + current) — stop while
+            // a current slot still fits.
+            if (static_cast<int>(promoted) * 2 + 2 > sc.slotCount) break;
+            const WRStaticLight &L =
+                mWr->staticLights[static_cast<size_t>(s.li)];
+            s.slotFrozen = acquireFrozenShadowSlot(
+                sc, *mWr, nextId--, L.loc, s.reach, ovBaked, 1);
+            if (s.slotFrozen >= 0) ++promoted;
+        }
+
+        struct StepStat {
+            float frac = 0.0f, deg = 0.0f;
+            double mean = 0.0;
+            float p95 = 0.0f, max = 0.0f;
+            double badPct = 0.0;
+            size_t texels = 0, transportBad = 0, capDropped = 0;
+            // Leg B: the same texels with the bake path's two shadow-test
+            // corrections applied (texel-centre plane reference +
+            // distance-proportional bias).
+            double meanB = 0.0, badPctB = 0.0;
+            float maxB = 0.0f;
+            // Leg C: differential OFF (the "shadows are dead" control).
+            double meanC = 0.0, badPctC = 0.0;
+            float maxC = 0.0f;
+            // The adjudication: over texels the swing actually changes.
+            size_t affN = 0;
+            double affA = 0.0, affC = 0.0, affFixedPct = 0.0;
+        };
+        std::vector<StepStat> stats;
+        struct PanelData {
+            int w = 0, h = 0;
+            std::vector<uint8_t> a, sMid, b;
+        };
+        struct BestPanel {
+            PanelData pd; size_t recIdx = 0; int16_t li = -1;
+            float maxErr = -1.0f; int step = -1;
+        };
+        BestPanel best;
+        size_t transportFailLights = 0;
+        bool transportReported = false;
+
+        for (int st = 1; st <= steps; ++st) {
+            const float frac = static_cast<float>(st) /
+                               static_cast<float>(steps);
+            const float ang = frac * 1.5707963f;    // 0 -> 90 degrees
+            const float c = std::cos(ang), sn = std::sin(ang);
+            const glm::mat3 rot(c, sn, 0, -sn, c, 0, 0, 0, 1);
+            const Vector3 posS = hinge + rot * (db.worldPos - hinge);
+            const glm::mat3 rotS = rot * db.rotation;
+
+            SwingOcc occS;
+            occS.base = &mOcclusion;
+            occS.skipBody = d->bodyIdx;
+            occS.pos = posS;
+            occS.he = db.edgeLengths * 0.5f;
+            occS.rot = rotS;
+            BakeFormula fS = mFormula;
+            fS.segmentBlockedFn = &SwingOcc::blocked;
+            fS.segmentBlockedCtx = &occS;
+
+            // Current-pose faces for every promoted light at THIS step.
+            const std::vector<ShadowCasterPoseOverride> ovS = {
+                {d->bodyIdx, posS, rotS}};
+            std::vector<int> slotCur(sls.size(), -1);
+            int curId = -9600;
+            for (size_t i = 0; i < sls.size(); ++i) {
+                if (sls[i].slotFrozen < 0) continue;
+                const WRStaticLight &L =
+                    mWr->staticLights[static_cast<size_t>(sls[i].li)];
+                slotCur[i] = acquireFrozenShadowSlot(
+                    sc, *mWr, curId--, L.loc, sls[i].reach, ovS, 1);
+            }
+            std::vector<float> atlas;
+            if (!readShadowAtlasBlocking(sc, atlas)) return;
+
+            // ── THE TRANSPORT ROUND-TRIP ──
+            // Pack each light's slot pair exactly as the frame loop does,
+            // then decode exactly as live_lights.sh does, and use the
+            // DECODED slots for every lookup below. Any light whose pair
+            // fails to survive the trip is named once, loudly: that is a
+            // shader reading unrelated faces, not a filtering artifact.
+            StepStat stat;
+            stat.frac = frac;
+            stat.deg = ang * 57.2957795f;
+            std::vector<int> useFrozen(sls.size(), -1);
+            std::vector<int> useCur(sls.size(), -1);
+            int liveUsed = 0;
+            for (size_t i = 0; i < sls.size(); ++i) {
+                if (sls[i].slotFrozen < 0 || slotCur[i] < 0) continue;
+                if (liveUsed >= kLiveLightCap) {
+                    ++stat.capDropped;   // shader never sees this light
+                    continue;
+                }
+                ++liveUsed;
+                const float packed =
+                    packLiveDiffSlots(sls[i].slotFrozen, slotCur[i]);
+                int df = -1, dc = -1;
+                unpackLiveDiffSlots(packed, df, dc);
+                if (df != sls[i].slotFrozen || dc != slotCur[i]) {
+                    ++stat.transportBad;
+                    if (!transportReported) {
+                        std::fprintf(stderr,
+                            "[SWING_DIAG] TRANSPORT FAULT light %d: packed "
+                            "(frozen %d, current %d) -> decoded (%d, %d). "
+                            "The shader differences the WRONG slot pair -- "
+                            "unrelated lights' shadow faces. Correct at "
+                            "rest (no differential term), destroys the "
+                            "lightmap for the whole swing.\n",
+                            static_cast<int>(sls[i].li), sls[i].slotFrozen,
+                            slotCur[i], df, dc);
+                        transportReported = true;
+                    }
+                    ++transportFailLights;
+                }
+                useFrozen[i] = df;
+                useCur[i] = dc;
+            }
+            // The slot pairs actually in play, once. The RANGE is the
+            // thing to read: the packing radix must exceed every current
+            // slot printed here, and a pool that hands out high slots is
+            // exactly what broke the old radix-16 encoding.
+            if (st == 1) {
+                int loSlot = 1 << 30, hiSlot = -1;
+                std::fprintf(stderr, "[SWING_DIAG] slot pairs:");
+                for (size_t i = 0; i < sls.size(); ++i) {
+                    if (sls[i].slotFrozen < 0 || slotCur[i] < 0) continue;
+                    std::fprintf(stderr, " L%d(f%d,c%d)",
+                                 static_cast<int>(sls[i].li),
+                                 sls[i].slotFrozen, slotCur[i]);
+                    loSlot = std::min({loSlot, sls[i].slotFrozen,
+                                       slotCur[i]});
+                    hiSlot = std::max({hiSlot, sls[i].slotFrozen,
+                                       slotCur[i]});
+                }
+                std::fprintf(stderr,
+                    "\n[SWING_DIAG] slot range [%d..%d]; packing radix %d "
+                    "(pool %d)\n",
+                    loSlot, hiSlot, kLiveSlotPackBase, sc.slotCount);
+            }
+
+            // Leg A — EXACTLY what live_lights.sh's differential does
+            // today: hard 1-tap, flat 0.5 world-unit bias, depth
+            // referenced to the FRAGMENT.
+            auto hardVis = [&](int slot, const Vector3 &lp, float reach,
+                               const Vector3 &P) -> float {
+                if (slot < 0 || slot >= sc.slotCount) return 1.0f;
+                const float stored =
+                    shadowAtlasSampleCPU(sc, atlas, slot, lp, P);
+                if (stored < 0.0f) return 1.0f;
+                const float dn = glm::length(P - lp) / reach;
+                return dn <= stored + 0.5f / reach ? 1.0f : 0.0f;
+            };
+
+            // Leg B — the SAME two corrections the GPU bake path already
+            // carries (liveShadowFactorPCSS), applied to the 1-tap:
+            //
+            //  (1) reference the depth to where the ray through the
+            //      SAMPLED TEXEL'S CENTRE meets the receiver plane, not
+            //      to the fragment's own distance. The stored value
+            //      belongs to the texel's direction; on a GRAZING
+            //      receiver (a floor lit from a doorway) that direction
+            //      lands far away along the same plane, so comparing it
+            //      against the fragment's distance reads as blocked.
+            //      That is self-shadow, and it is a whole-texel-sized
+            //      block because a 256^2 face texel covers a lot of
+            //      floor at grazing incidence.
+            //  (2) a distance-proportional bias instead of a flat 0.5
+            //      world units, which is thicker than a door leaf and
+            //      swallows the very occluder the differential exists
+            //      to show.
+            //
+            // Running both legs over the same texels ATTRIBUTES the
+            // residual: if B collapses it, the live path simply never
+            // received the bake path's fixes.
+            auto planeVis = [&](int slot, const Vector3 &lp, float reach,
+                                const Vector3 &P,
+                                const Vector3 &n) -> float {
+                if (slot < 0 || slot >= sc.slotCount) return 1.0f;
+                const float stored =
+                    shadowAtlasSampleCPU(sc, atlas, slot, lp, P);
+                if (stored < 0.0f) return 1.0f;
+                const int face = shadowFaceForDirection(P - lp);
+                float u = 0.0f, v = 0.0f;
+                if (!shadowFaceUV(lp, face, P, u, v)) return 1.0f;
+                Vector3 fwd, rgt, up;
+                shadowFaceBasis(face, fwd, rgt, up);
+                // Snap to the sampled texel's centre — the direction the
+                // stored depth actually belongs to.
+                const float fs = static_cast<float>(sc.faceSize);
+                const float tu =
+                    (std::floor(u * fs) + 0.5f) / fs;
+                const float tv =
+                    (std::floor(v * fs) + 0.5f) / fs;
+                const Vector3 dir = glm::normalize(
+                    fwd + (2.0f * tu - 1.0f) * rgt
+                        + (2.0f * tv - 1.0f) * up);
+                const float nd = glm::dot(n, dir);
+                const float d = glm::length(P - lp);
+                float ref = d / reach;                 // fallback
+                if (std::abs(nd) >= 1e-4f) {
+                    const float t = glm::dot(n, P - lp) / nd;
+                    if (t > 0.0f) ref = t / reach;
+                }
+                const float bias = (0.05f + 0.030f * d) / reach;
+                return ref <= stored + bias ? 1.0f : 0.0f;
+            };
+
+            std::vector<float> errs;
+            double sumErr = 0.0, sumErrB = 0.0, sumErrC = 0.0;
+            size_t nTex = 0, nBad = 0, nBadB = 0, nBadC = 0;
+            float maxErrB = 0.0f, maxErrC = 0.0f;
+            double sumAffA = 0.0, sumAffC = 0.0;
+            size_t nAff = 0, nAffFixed = 0;
+            for (size_t i = 0; i < sls.size(); ++i) {
+                if (useFrozen[i] < 0 || useCur[i] < 0) continue;
+                const SwingLight &s = sls[i];
+                const WRStaticLight &L =
+                    mWr->staticLights[static_cast<size_t>(s.li)];
+                std::vector<uint8_t> mask(mWr->staticLights.size(), 0);
+                mask[static_cast<size_t>(s.li)] = 1;
+                const std::vector<uint16_t> lightList = {
+                    1, static_cast<uint16_t>(s.li)};
+                for (const auto &pr : lw->second) {
+                    if (pr.second != s.li) continue;
+                    const size_t recIdx = pr.first;
+                    if (recIdx >= mAnimPolys->size()) continue;
+                    const RebakedAnimPoly &rec = (*mAnimPolys)[recIdx];
+                    size_t k = 0;
+                    for (; k < rec.overlayLightIdx.size(); ++k)
+                        if (rec.overlayLightIdx[k] == s.li) break;
+                    if (k >= rec.overlays.size()) continue;
+                    const LumelGrid grid =
+                        buildLumelGrid(*mWr, rec.ci, rec.pi, mDensity);
+                    if (!grid.valid || grid.lx != rec.w ||
+                        grid.ly != rec.h)
+                        continue;
+                    BakeStats bst;
+                    std::vector<Vector3> truthS;
+                    if (!bakePolygon(*mWr, *mRp, rec.ci, rec.pi, fS,
+                                     mLightCells, truthS, bst, nullptr,
+                                     mask.data(), nullptr, &lightList))
+                        continue;
+                    if (static_cast<int>(truthS.size()) != rec.w * rec.h)
+                        continue;
+                    PanelData pd;
+                    pd.w = rec.w; pd.h = rec.h;
+                    const size_t np =
+                        static_cast<size_t>(rec.w) * rec.h * 3;
+                    pd.a.resize(np); pd.sMid.resize(np); pd.b.resize(np);
+                    float polyMax = 0.0f;
+                    for (int j = 0; j < rec.h; ++j)
+                        for (int ii = 0; ii < rec.w; ++ii) {
+                            const size_t t =
+                                static_cast<size_t>(j) * rec.w + ii;
+                            const Vector3 P = grid.at(ii, j);
+                            const Vector3 toL = L.loc - P;
+                            const float dist2 = glm::dot(toL, toL);
+                            const float dist =
+                                std::sqrt(std::max(dist2, 1e-6f));
+                            const float cosT =
+                                glm::dot(grid.normal, toL) / dist;
+                            const float a2 = mFormula.emitterRadius *
+                                             mFormula.emitterRadius;
+                            float live = 0.0f, liveB = 0.0f;
+                            // Shader's reach cutoff (u_liveLightPos.w).
+                            const bool inReach =
+                                dist2 <= s.reach * s.reach;
+                            if (cosT > 0.0f && inReach) {
+                                const float hl = cosT * 0.5f + 0.5f;
+                                const float hlFall = hl / (dist2 + a2);
+                                const float dv =
+                                    hardVis(useCur[i], L.loc, s.reach, P) -
+                                    hardVis(useFrozen[i], L.loc, s.reach,
+                                            P);
+                                live = hlFall * dv;
+                                const float dvB =
+                                    planeVis(useCur[i], L.loc, s.reach, P,
+                                             grid.normal) -
+                                    planeVis(useFrozen[i], L.loc, s.reach,
+                                             P, grid.normal);
+                                liveB = hlFall * dvB;
+                            }
+                            const uint16_t *ovA = &rec.overlays[k][t * 3];
+                            float texErr = 0.0f, texErrB = 0.0f, texErrC = 0.0f;
+                            for (int ch = 0; ch < 3; ++ch) {
+                                const float baked = halfToFloat(ovA[ch]);
+                                const float screen = std::max(
+                                    0.0f, baked + s.colorK[ch] * live);
+                                // HDR-vs-HDR — see the same note in
+                                // runDiffDiagnostic. Clamp for DISPLAY
+                                // only; clamping one side of the
+                                // comparison invents error on every
+                                // above-1.0 texel.
+                                const float truth =
+                                    std::max(0.0f, truthS[t][ch]);
+                                pd.a[t * 3 + ch] = static_cast<uint8_t>(
+                                    std::min(1.0f, baked) * 255.0f);
+                                pd.sMid[t * 3 + ch] =
+                                    static_cast<uint8_t>(
+                                        std::min(1.0f, screen) * 255.0f);
+                                pd.b[t * 3 + ch] = static_cast<uint8_t>(
+                                    std::min(1.0f, truth) * 255.0f);
+                                texErr = std::max(
+                                    texErr, std::abs(screen - truth));
+                                const float screenB = std::max(
+                                    0.0f, baked + s.colorK[ch] * liveB);
+                                texErrB = std::max(
+                                    texErrB, std::abs(screenB - truth));
+                                // Leg C — the COUNTERFACTUAL: differential
+                                // OFF, i.e. the screen still showing the
+                                // baked (pre-swing) overlay. This is what
+                                // "the dynamic door shadows are dead"
+                                // measures, and it is the control that
+                                // makes legA's number mean something:
+                                // if A is far below C, the differential
+                                // is doing real work.
+                                texErrC = std::max(
+                                    texErrC, std::abs(baked - truth));
+                            }
+                            sumErr += texErr;
+                            errs.push_back(texErr);
+                            ++nTex;
+                            if (texErr > 8.0f / 255.0f) ++nBad;
+                            polyMax = std::max(polyMax, texErr);
+                            sumErrB += texErrB;
+                            if (texErrB > 8.0f / 255.0f) ++nBadB;
+                            maxErrB = std::max(maxErrB, texErrB);
+                            sumErrC += texErrC;
+                            if (texErrC > 8.0f / 255.0f) ++nBadC;
+                            maxErrC = std::max(maxErrC, texErrC);
+                            // ADJUDICATION SUBSET: texels the swing
+                            // actually changes. Averaging over every cone
+                            // poly of every promoted light dilutes the
+                            // door's own effect into nothing (most of
+                            // those polys are far from the leaf and do
+                            // not move), which is why the whole-sweep
+                            // means cannot tell a live differential from
+                            // a dead one. Selector = leg C, i.e. "the
+                            // baked overlay alone is wrong here by more
+                            // than 8/255", which is precisely the set the
+                            // dynamic shadow exists to correct.
+                            if (texErrC > 8.0f / 255.0f) {
+                                ++nAff;
+                                sumAffA += texErr;
+                                sumAffC += texErrC;
+                                if (texErr <= 8.0f / 255.0f) ++nAffFixed;
+                            }
+                        }
+                    if (polyMax > best.maxErr) {
+                        best.pd = std::move(pd);
+                        best.recIdx = recIdx;
+                        best.li = s.li;
+                        best.maxErr = polyMax;
+                        best.step = st;
+                    }
+                }
+            }
+            for (size_t i = 0; i < sls.size(); ++i)
+                if (slotCur[i] >= 0) sc.slots[slotCur[i]] = ShadowSlot{};
+
+            if (nTex) {
+                std::sort(errs.begin(), errs.end());
+                stat.mean = 255.0 * sumErr / nTex;
+                stat.p95 = 255.0f *
+                    errs[static_cast<size_t>(errs.size() * 0.95)];
+                stat.max = 255.0f * errs.back();
+                stat.badPct = 100.0 * nBad / nTex;
+                stat.texels = nTex;
+                stat.meanB = 255.0 * sumErrB / nTex;
+                stat.maxB = 255.0f * maxErrB;
+                stat.badPctB = 100.0 * nBadB / nTex;
+                stat.meanC = 255.0 * sumErrC / nTex;
+                stat.maxC = 255.0f * maxErrC;
+                stat.badPctC = 100.0 * nBadC / nTex;
+                stat.affN = nAff;
+                if (nAff) {
+                    stat.affA = 255.0 * sumAffA / nAff;
+                    stat.affC = 255.0 * sumAffC / nAff;
+                    stat.affFixedPct = 100.0 * nAffFixed / nAff;
+                }
+            }
+            stats.push_back(stat);
+        }
+        for (const SwingLight &s : sls)
+            if (s.slotFrozen >= 0) sc.slots[s.slotFrozen] = ShadowSlot{};
+
+        std::fprintf(stderr,
+            "[SWING_DIAG] door %d: %zu promotable lights, %zu promoted, "
+            "%d steps over a 90 deg swing. Per-step midswing-vs-settled "
+            "|err| (the CURVE is the readout -- a hump means a "
+            "pose-dependent fault, a plateau means a constant one):\n",
+            doorID, sls.size(), promoted, steps);
+        std::fprintf(stderr,
+            "[SWING_DIAG]   legA = the shader's CURRENT differential "
+            "(hard 1-tap, flat 0.5u bias, fragment-referenced depth).\n"
+            "[SWING_DIAG]   legB = same texels with the BAKE path's two "
+            "corrections (texel-centre plane reference + "
+            "distance-proportional bias). If B collapses A's residual, "
+            "the live path simply never got the bake path's fixes.\n"
+            "[SWING_DIAG]   legC = CONTROL: differential OFF (screen keeps "
+            "the pre-swing baked overlay).\n"
+            "[SWING_DIAG]   THE ADJUDICATION is the last block: over the "
+            "texels the swing ACTUALLY changes (leg C wrong by >8/255 -- "
+            "whole-sweep means dilute the door's effect into nothing). "
+            "affA << affC = dynamic shadows ALIVE; affA ~= affC = DEAD. "
+            "'fixed' = share of those texels the differential brings back "
+            "under 8/255.\n");
+        std::fprintf(stderr,
+            "[SWING_DIAG]   %5s %6s | %8s %8s %8s | %8s %8s | %8s %8s"
+            " | %5s\n",
+            "step", "deg", "A mean", "A max", "A >8/255",
+            "B mean", "B >8/255", "C mean", "C >8/255", "xport");
+        for (size_t i = 0; i < stats.size(); ++i) {
+            const StepStat &s = stats[i];
+            std::fprintf(stderr,
+                "[SWING_DIAG]   %5zu %6.1f | %8.2f %8.1f %7.2f%% | "
+                "%8.2f %7.2f%% | %8.2f %7.2f%% | %5zu\n",
+                i + 1, s.deg, s.mean, s.max, s.badPct,
+                s.meanB, s.badPctB, s.meanC, s.badPctC,
+                s.transportBad);
+        }
+        std::fprintf(stderr,
+            "[SWING_DIAG]   %5s %6s | %9s %9s %9s %8s\n",
+            "step", "deg", "affected", "affA/255", "affC/255", "fixed");
+        for (size_t i = 0; i < stats.size(); ++i) {
+            const StepStat &s = stats[i];
+            std::fprintf(stderr,
+                "[SWING_DIAG]   %5zu %6.1f | %9zu %9.2f %9.2f %7.1f%%\n",
+                i + 1, s.deg, s.affN, s.affA, s.affC, s.affFixedPct);
+        }
+        if (transportFailLights) {
+            std::fprintf(stderr,
+                "[SWING_DIAG] VERDICT: %zu light-steps failed the slot "
+                "transport round-trip. This is a TRANSPORT bug, not a "
+                "filtering or bias one -- the numbers above understate it, "
+                "because this harness's CPU lookup at least reads a VALID "
+                "slot, while the GPU reads whatever those faces hold.\n",
+                transportFailLights);
+        } else {
+            std::fprintf(stderr,
+                "[SWING_DIAG] slot transport round-trip: PASS for every "
+                "light at every step.\n");
+        }
+
+        if (best.step > 0 && best.pd.w > 0) {
+            const RebakedAnimPoly &rec = (*mAnimPolys)[best.recIdx];
+            std::fprintf(stderr,
+                "[SWING_DIAG] worst poly: cell %u poly %d light %d "
+                "(%dx%d) at step %d, maxErr %.1f/255\n",
+                rec.ci, rec.pi, static_cast<int>(best.li), best.pd.w,
+                best.pd.h, best.step, 255.0f * best.maxErr);
+            std::error_code ec;
+            std::filesystem::create_directories("doorshadow_diag", ec);
+            const PanelData &pd = best.pd;
+            const int up = 8, sep = 2;
+            const int W = pd.w * up * 4 + sep * 3, H = pd.h * up;
+            std::vector<uint8_t> img(static_cast<size_t>(W) * H * 3, 32);
+            auto putPanel = [&](int panel, auto pix) {
+                const int x0 = panel * (pd.w * up + sep);
+                for (int y = 0; y < H; ++y)
+                    for (int x = 0; x < pd.w * up; ++x) {
+                        uint8_t rgb[3];
+                        pix(x / up, y / up, rgb);
+                        uint8_t *o =
+                            &img[(static_cast<size_t>(y) * W + x0 + x) * 3];
+                        o[0] = rgb[0]; o[1] = rgb[1]; o[2] = rgb[2];
+                    }
+            };
+            auto plain = [&](const std::vector<uint8_t> &buf) {
+                return [&buf, &pd](int x, int y, uint8_t *rgb) {
+                    const size_t t =
+                        (static_cast<size_t>(y) * pd.w + x) * 3;
+                    rgb[0] = buf[t]; rgb[1] = buf[t + 1];
+                    rgb[2] = buf[t + 2];
+                };
+            };
+            putPanel(0, plain(pd.a));      // baked overlay (swing start)
+            putPanel(1, plain(pd.sMid));   // what the screen builds
+            putPanel(2, plain(pd.b));      // settled truth at that pose
+            putPanel(3, [&](int x, int y, uint8_t *rgb) {
+                const size_t t = (static_cast<size_t>(y) * pd.w + x) * 3;
+                int dpos = 0, dneg = 0;
+                for (int ch = 0; ch < 3; ++ch) {
+                    const int dd =
+                        int(pd.sMid[t + ch]) - int(pd.b[t + ch]);
+                    dpos = std::max(dpos, dd);
+                    dneg = std::max(dneg, -dd);
+                }
+                rgb[0] = static_cast<uint8_t>(std::min(255, dpos * 8));
+                rgb[1] = 0;
+                rgb[2] = static_cast<uint8_t>(std::min(255, dneg * 8));
+            });
+            char path[160];
+            std::snprintf(path, sizeof(path),
+                          "doorshadow_diag/swing_d%d_s%d_c%u_p%d_l%d.ppm",
+                          doorID, best.step, rec.ci, rec.pi,
+                          static_cast<int>(best.li));
+            if (FILE *f = std::fopen(path, "wb")) {
+                std::fprintf(f, "P6\n%d %d\n255\n", W, H);
+                std::fwrite(img.data(), 1, img.size(), f);
+                std::fclose(f);
+                std::fprintf(stderr, "[SWING_DIAG] wrote %s "
+                             "[bakedOverlay | screen | settled | err x8]\n",
+                             path);
+            }
+        }
+    }
+
 private:
     // Re-bake ONE light's overlay buffer on ONE poly at current door
     // poses, and mark the rec ready for re-blend. The light list handed
@@ -1716,9 +2416,10 @@ private:
                 da.weight = d4[3] / 255.0f * rec.dirBaseWeightScale;
                 const Vector3 wp = grid.at(i, j);
                 for (const DoorOv &ov : doorOvs) {
-                    const uint8_t *px = &(*ov.buf)[t * 3];
-                    const float lum =
-                        std::max({px[0], px[1], px[2]}) / 255.0f;
+                    const uint16_t *px = &(*ov.buf)[t * 3];
+                    const float lum = std::max({halfToFloat(px[0]),
+                                                halfToFloat(px[1]),
+                                                halfToFloat(px[2])});
                     if (lum <= 0.0f) continue;
                     const Vector3 toL = ov.loc - wp;
                     const float len = glm::length(toL);

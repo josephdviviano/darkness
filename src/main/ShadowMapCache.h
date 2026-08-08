@@ -51,6 +51,7 @@
 #include "RayCaster.h"      // the CPU oracle for the acceptance cross-check
 #include "CellGeometry.h"   // findCameraCell — "is this light inside the world"
 #include "PostProcess.h"    // kViewShadowFaces / kViewShadowDebug ownership
+#include "LiveLightPack.h"  // S4c differential slot transport (C++<->GLSL)
 #include "../services/physics/ObjectCollisionGeometry.h"  // S4b dynamic casters
 
 #include <bgfx/bgfx.h>
@@ -64,6 +65,17 @@ namespace Darkness {
 
 static_assert(kShadowFaceCount == 6,
               "PostProcess.h reserves view ids as kShadowMaxPoolSlots * 6");
+
+// The S4c differential transport packs TWO pool slots into one float
+// (LiveLightPack.h). Growing the pool past the packing radix silently
+// makes the shader difference two UNRELATED lights' faces while a door
+// swings -- correct at rest, garbage mid-swing. Fail the build instead.
+static_assert(kShadowMaxPoolSlots <= kLiveSlotPackBase,
+              "shadow pool outgrew the S4c differential slot packing -- "
+              "raise kLiveSlotPackBase AND the matching literal in "
+              "shaders/live_lights.sh together");
+static_assert(kLiveDiffPackBias > static_cast<float>(kShadowMaxPoolSlots),
+              "a plain slot index must never reach the differential band");
 
 // Position-only caster vertex.
 struct ShadowCasterVertex {

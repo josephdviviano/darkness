@@ -29,6 +29,8 @@ add_executable(darkness_tests
     test_flicker_synthesis.cpp
     test_shadow_face_math.cpp
     test_door_portal_binding.cpp
+    test_half_float.cpp
+    test_live_light_pack.cpp
     test_config_help.cpp
 )
 

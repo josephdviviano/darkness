@@ -103,6 +103,23 @@ float liveTileStored(float tx, float ty, float u, float v)
     return texture2D(s_liveShadowAtlas, uv).r;
 }
 
+// Distance from the light to where a tap's ray meets the receiver plane,
+// reach-normalised. Exact on planar lumels, which every WR polygon is.
+// `planeD` = dot(n, P - L). Returns `fallback` when the ray is near-parallel
+// to the plane (dot(n,dir) ~ 0), where the intersection is unstable and no
+// answer is better than a huge one.
+float tapPlaneRef(vec3 n, float planeD, vec3 fwd, vec3 rgt, vec3 up,
+                  float tu, float tv, float invReach, float fallback)
+{
+    vec3 dir = normalize(fwd + (2.0 * tu - 1.0) * rgt
+                             + (2.0 * tv - 1.0) * up);
+    float nd = dot(n, dir);
+    if (abs(nd) < 1e-4) return fallback;
+    float t = planeD / nd;
+    if (t <= 0.0) return fallback;
+    return t * invReach;
+}
+
 // PCSS visibility — soft penumbra from the stored LINEAR occluder
 // distance: width = emitterA * (dRecv - dOcc) / dOcc, projected to face
 // UV (a world offset s at the receiver subtends s/dRecv; u spans the
@@ -112,8 +129,23 @@ float liveTileStored(float tx, float ty, float u, float v)
 // path stays bit-exact). ~14 taps: used by the OFFSCREEN lumel bake so
 // event re-bakes keep the load bake's soft edges — not by the per-frame
 // lightmapped shaders.
+// `recvNormal` is the RECEIVER's plane normal. Every tap of a PCF/PCSS
+// kernel looks up a DIFFERENT direction from the light, so comparing them
+// all against the centre fragment's own distance is only right when the
+// receiver is perpendicular to the light — on a grazing receiver the
+// neighbouring taps land on parts of the SAME plane at a different depth
+// and read as blocked. That is the grazing acne the --door-diff-diag
+// harness classified as gpuPhantomShadow. MEASURED A/B on door 407, same
+// build, only this term toggled (the [hard] leg is identical in both runs,
+// which is the internal control): gpuPhantomShadow 341 -> 15, a 96%
+// reduction.
+//
+// The fix is exact rather than a bias hack: WR polygons are planar, so the
+// reference distance for a tap is where that tap's ray actually meets the
+// receiver plane — t = dot(n, P-L) / dot(n, dir). Pass a zero normal to
+// keep the old fragment-distance behaviour.
 float liveShadowFactorPCSS(vec3 worldPos, vec3 lightPos, float slot,
-                           float invReach, float emitterA)
+                           float invReach, float emitterA, vec3 recvNormal)
 {
     if (slot < 0.0) return 1.0;
     vec3 d = worldPos - lightPos;
@@ -138,50 +170,100 @@ float liveShadowFactorPCSS(vec3 worldPos, vec3 lightPos, float slot,
     float tx = tile - tpr * floor(tile / tpr);
     float ty = floor(tile / tpr);
     float distNorm = length(d) * invReach;
-    float biasNorm = 0.5 * invReach;
+
+    // Plane-referenced tap depth. planeD = dot(n, P - L); a tap direction
+    // dir hits the plane at t = planeD / dot(n, dir), which IS the distance
+    // along that ray. Falls back to the fragment distance when the caller
+    // passes no normal, or when the ray is near-parallel to the plane.
+    float planeD = dot(recvNormal, worldPos - lightPos);
+    bool usePlane = dot(recvNormal, recvNormal) > 0.5;
+
+    // Depth bias, DERIVED not tuned: what it must cover is the OCCLUDER's
+    // depth quantisation in the face, and a face texel subtends a fixed
+    // ANGLE, not a fixed distance. One texel of a 90-degree frustum at
+    // faceSize F spans z * 2/F laterally, so at F=256 that is z/128;
+    // allowing a moderate receiver slope (x2-x4) puts the coefficient in
+    // 0.016z..0.031z.
+    //
+    // The two acceptance gates pull opposite ways, so both endpoints are
+    // recorded rather than implied (door 407 / [LUMEL_BAKE], measured):
+    //   0.020 + 0.012z : door-diff 39 phantom / 38 missed, self-test FAIL 7.57
+    //   0.050 + 0.030z : door-diff 18 phantom / 171 missed, self-test PASS 1.98
+    // A larger bias makes the GPU more LIT, which helps a mostly-lit
+    // self-test rect and hurts occlusion detection.
+    //
+    // A CONSTANT was wrong at both ends: the original 0.5 world units is
+    // thicker than a door leaf and swallowed occluders whole; 0.05 let far
+    // surfaces self-shadow.
+    float biasNorm = usePlane
+        ? (0.05 + 0.030 * length(d)) * invReach
+        : 0.5 * invReach;
+
+    // Reference depth for a tap at face-UV (tu,tv). u = dot(d,rgt)/z*0.5+0.5
+    // inverts to dot(d,rgt)/z = 2u-1, so the tap's ray direction is
+    // fwd + (2tu-1)*rgt + (2tv-1)*up.
+    #define LIVE_TAP_REF(tu, tv) ( usePlane                                   \
+        ? tapPlaneRef(recvNormal, planeD, fwd, rgt, up, (tu), (tv), invReach, \
+                      distNorm)                                              \
+        : distNorm )
 
     // Blocker search: centre + 4 diagonals over the emitter's projected
     // extent at this depth.
     float searchR = clamp(0.5 * emitterA / max(z, 0.5), 0.004, 0.04);
     float occSum = 0.0;
     float occN = 0.0;
+    float r0 = LIVE_TAP_REF(u, v);
     float s0 = liveTileStored(tx, ty, u, v);
-    if (s0 + biasNorm < distNorm) { occSum += s0; occN += 1.0; }
+    if (s0 + biasNorm < r0) { occSum += s0; occN += 1.0; }
     float s1 = liveTileStored(tx, ty, u - searchR, v - searchR);
-    if (s1 + biasNorm < distNorm) { occSum += s1; occN += 1.0; }
+    if (s1 + biasNorm < LIVE_TAP_REF(u - searchR, v - searchR))
+        { occSum += s1; occN += 1.0; }
     float s2 = liveTileStored(tx, ty, u + searchR, v - searchR);
-    if (s2 + biasNorm < distNorm) { occSum += s2; occN += 1.0; }
+    if (s2 + biasNorm < LIVE_TAP_REF(u + searchR, v - searchR))
+        { occSum += s2; occN += 1.0; }
     float s3 = liveTileStored(tx, ty, u - searchR, v + searchR);
-    if (s3 + biasNorm < distNorm) { occSum += s3; occN += 1.0; }
+    if (s3 + biasNorm < LIVE_TAP_REF(u - searchR, v + searchR))
+        { occSum += s3; occN += 1.0; }
     float s4 = liveTileStored(tx, ty, u + searchR, v + searchR);
-    if (s4 + biasNorm < distNorm) { occSum += s4; occN += 1.0; }
+    if (s4 + biasNorm < LIVE_TAP_REF(u + searchR, v + searchR))
+        { occSum += s4; occN += 1.0; }
     if (occN < 0.5) return 1.0;                       // fully lit
     float dOccN = occSum / occN;                      // reach-normalised
     float ratio = max(distNorm - dOccN, 0.0) / max(dOccN, 1e-4);
     float uvR = clamp(0.5 * emitterA * ratio * invReach / distNorm,
                       0.0, 0.05);
     if (uvR < 0.002)   // sub-texel penumbra: the hard test IS the answer
-        return (distNorm <= s0 + biasNorm) ? 1.0 : 0.0;
+        return (r0 <= s0 + biasNorm) ? 1.0 : 0.0;
 
-    // PCF: centre + 8-tap disc at the penumbra radius.
-    float lit = (distNorm <= s0 + biasNorm) ? 1.0 : 0.0;
-    float t;
-    t = liveTileStored(tx, ty, u - 0.7071 * uvR, v);
-    lit += (distNorm <= t + biasNorm) ? 1.0 : 0.0;
-    t = liveTileStored(tx, ty, u + 0.7071 * uvR, v);
-    lit += (distNorm <= t + biasNorm) ? 1.0 : 0.0;
-    t = liveTileStored(tx, ty, u, v - 0.7071 * uvR);
-    lit += (distNorm <= t + biasNorm) ? 1.0 : 0.0;
-    t = liveTileStored(tx, ty, u, v + 0.7071 * uvR);
-    lit += (distNorm <= t + biasNorm) ? 1.0 : 0.0;
-    t = liveTileStored(tx, ty, u - 0.35 * uvR, v - 0.35 * uvR);
-    lit += (distNorm <= t + biasNorm) ? 1.0 : 0.0;
-    t = liveTileStored(tx, ty, u + 0.35 * uvR, v - 0.35 * uvR);
-    lit += (distNorm <= t + biasNorm) ? 1.0 : 0.0;
-    t = liveTileStored(tx, ty, u - 0.35 * uvR, v + 0.35 * uvR);
-    lit += (distNorm <= t + biasNorm) ? 1.0 : 0.0;
-    t = liveTileStored(tx, ty, u + 0.35 * uvR, v + 0.35 * uvR);
-    lit += (distNorm <= t + biasNorm) ? 1.0 : 0.0;
+    // PCF: centre + 8-tap disc at the penumbra radius. Each tap carries its
+    // OWN plane-referenced depth (see LIVE_TAP_REF).
+    float lit = (r0 <= s0 + biasNorm) ? 1.0 : 0.0;
+    float t; float tu; float tv;
+    tu = u - 0.7071 * uvR; tv = v;
+    t = liveTileStored(tx, ty, tu, tv);
+    lit += (LIVE_TAP_REF(tu, tv) <= t + biasNorm) ? 1.0 : 0.0;
+    tu = u + 0.7071 * uvR; tv = v;
+    t = liveTileStored(tx, ty, tu, tv);
+    lit += (LIVE_TAP_REF(tu, tv) <= t + biasNorm) ? 1.0 : 0.0;
+    tu = u; tv = v - 0.7071 * uvR;
+    t = liveTileStored(tx, ty, tu, tv);
+    lit += (LIVE_TAP_REF(tu, tv) <= t + biasNorm) ? 1.0 : 0.0;
+    tu = u; tv = v + 0.7071 * uvR;
+    t = liveTileStored(tx, ty, tu, tv);
+    lit += (LIVE_TAP_REF(tu, tv) <= t + biasNorm) ? 1.0 : 0.0;
+    tu = u - 0.35 * uvR; tv = v - 0.35 * uvR;
+    t = liveTileStored(tx, ty, tu, tv);
+    lit += (LIVE_TAP_REF(tu, tv) <= t + biasNorm) ? 1.0 : 0.0;
+    tu = u + 0.35 * uvR; tv = v - 0.35 * uvR;
+    t = liveTileStored(tx, ty, tu, tv);
+    lit += (LIVE_TAP_REF(tu, tv) <= t + biasNorm) ? 1.0 : 0.0;
+    tu = u - 0.35 * uvR; tv = v + 0.35 * uvR;
+    t = liveTileStored(tx, ty, tu, tv);
+    lit += (LIVE_TAP_REF(tu, tv) <= t + biasNorm) ? 1.0 : 0.0;
+    tu = u + 0.35 * uvR; tv = v + 0.35 * uvR;
+    t = liveTileStored(tx, ty, tu, tv);
+    lit += (LIVE_TAP_REF(tu, tv) <= t + biasNorm) ? 1.0 : 0.0;
+    #undef LIVE_TAP_REF
     return lit / 9.0;
 }
 
@@ -211,9 +293,20 @@ vec3 liveLightSum(vec3 worldPos, vec3 camPos)
         float shadow;
         if (sw >= 99.5) {
             // Differential (S4c): current-pose minus frozen-pose.
+            //
+            // MIRROR of LiveLightPack.h — kLiveDiffPackBias (100) and
+            // kLiveSlotPackBase (128). The radix MUST cover the whole
+            // shadow pool: it was 16, written when the pool held 16 slots,
+            // and once the pool grew every promoted light whose current
+            // slot landed at 16+ decoded to a different pair, so this
+            // differenced two unrelated lights' faces. Invisible at rest
+            // (a settled door carries no differential) and destroyed the
+            // lightmap for the whole duration of a swing.
+            // tests/test_live_light_pack.cpp sweeps the entire legal slot
+            // range against these exact constants — edit both ends together.
             float t = sw - 100.0;
-            float sFrozen = floor(t / 16.0);
-            float sCur = t - sFrozen * 16.0;
+            float sFrozen = floor(t / 128.0);
+            float sCur = t - sFrozen * 128.0;
             shadow = liveShadowFactor(worldPos, u_liveLightPos[i].xyz,
                                       sCur, invReach)
                    - liveShadowFactor(worldPos, u_liveLightPos[i].xyz,

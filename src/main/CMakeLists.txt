@@ -492,6 +492,14 @@ add_custom_target(compile_shaders DEPENDS
     ${CMAKE_CURRENT_BINARY_DIR}/.corona_shared_stamp
     ${CMAKE_CURRENT_BINARY_DIR}/.smaa_shared_stamp
     ${CMAKE_CURRENT_BINARY_DIR}/.lm_specular_stamp
+    # WAS MISSING (found 2026-08-08): the .live_lights_stamp rule above was
+    # written but never listed here, so it never ran. Every edit to
+    # live_lights.sh since — the LIVE_LIGHT_CAP raise, the PCSS kernel, the
+    # S4c differential — silently compiled nothing, and the GPU kept running
+    # whatever bytecode was current when a .sc file last changed for some
+    # other reason. This is the exact failure CLAUDE.md's shader-pipeline
+    # note warns about; the note was right and the wiring was not.
+    ${CMAKE_CURRENT_BINARY_DIR}/.live_lights_stamp
 )
 
 add_executable(darknessRender DarknessRender.cpp)

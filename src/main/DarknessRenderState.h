@@ -328,12 +328,10 @@ struct GPUResources {
     bgfx::UniformHandle s_liveShadowAtlas = BGFX_INVALID_HANDLE;
 };
 
-// Mirrors LIVE_LIGHT_CAP in shaders/live_lights.sh.
-// 32 = the upper industry-standard shadowed-light budget (rationale at
-// PostProcess.h kShadowMaxPoolSlots, which is sized to match: 2 slots
-// per differential + live emitters). The shader loop is count-gated, so
-// inactive entries cost one compare each.
-constexpr int kLiveLightCap = 32;
+// kLiveLightCap (mirrors LIVE_LIGHT_CAP in shaders/live_lights.sh) now
+// lives in LiveLightPack.h alongside the slot transport it belongs with,
+// so headers BELOW this one — DoorShadowSystem.h, which this header
+// includes — can see it too.
 
 // One light promoted out of the baked atlas (or transient, e.g. the
 // player lantern / live emitters). colorK carries bright x brightScale x K_i —

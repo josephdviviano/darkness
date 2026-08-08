@@ -16,6 +16,8 @@ uniform vec4 u_bakeSpanV;    // xyz = axisV * stepV * ly
 uniform vec4 u_bakeNormal;   // xyz plane normal (faces the cell's air)
 uniform vec4 u_bakeLight;    // xyz light pos, w = reach^2
 uniform vec4 u_bakeColor;    // rgb = bright x brightScale x K_i, w = slot
+uniform vec4 u_bakeSpot;     // xyz = cone axis, w = inner cosine (-1 = omni)
+                             // (the OUTER cosine rides u_bakeNormal.w)
 
 void main()
 {
@@ -35,6 +37,23 @@ void main()
         return;
     }
     float halfLam = cosT * 0.5 + 0.5;
+
+    // Spotlight cone, mirroring bakeOneLight's construction exactly: a
+    // linear ramp between the two cone COSINES, hard cutoff at the outer.
+    // Spot door lights used to fall back to CPU rays for want of this —
+    // 240 of door 407's 1681 rects, the last CPU path in the event.
+    float spot = 1.0;
+    if (u_bakeSpot.w != -1.0) {
+        float dotVal = dot(-v / dist, u_bakeSpot.xyz);
+        if (dotVal <= u_bakeNormal.w) {
+            gl_FragColor = vec4(0.0, 0.0, 0.0, 1.0);
+            return;
+        }
+        if (dotVal < u_bakeSpot.w) {
+            float denom = u_bakeSpot.w - u_bakeNormal.w;
+            spot = (denom > 1e-6) ? (dotVal - u_bakeNormal.w) / denom : 1.0;
+        }
+    }
     float fall = 1.0 / (d2 + u_liveFalloff.x);
     // Visibility from the offset probe point, like the bake's rays.
     vec3 probe = worldPos + u_bakeNormal.xyz * u_bakeOrigin.w;
@@ -43,10 +62,14 @@ void main()
     // — the rest-state artifact class the --door-diff-diag harness
     // exposed). PCSS emitter size rides u_liveFalloff.y; 0 = exact
     // hard tap (the self-test path).
+    // The polygon plane goes in so every PCF tap is depth-referenced to
+    // where its OWN ray meets that plane, not to this fragment's distance.
+    // Without it, grazing receivers self-shadow at the kernel edges — the
+    // gpuPhantomShadow class the door-diff harness counted.
     float shadow = liveShadowFactorPCSS(
         probe, u_bakeLight.xyz, u_bakeColor.w,
         inversesqrt(max(u_bakeLight.w, 1e-6)),
-        u_liveFalloff.y);
+        u_liveFalloff.y, u_bakeNormal.xyz);
 
     // The Continuous 5-bit storage transform — the CPU accumulator's
     // exact math (LumelAccumulator::add, Continuous case, incl. the C1
@@ -60,6 +83,13 @@ void main()
         return;
     }
     float lux = peak * 255.0 * shadow - 0.5;
+    if (lux <= 0.0) {
+        gl_FragColor = vec4(0.0, 0.0, 0.0, 1.0);
+        return;
+    }
+    lux *= spot;          // AFTER the -0.5 and its test: LumelAccumulator's
+                          // Continuous case does exactly this, and the order
+                          // is visible in the result inside the penumbra.
     if (lux <= 0.0) {
         gl_FragColor = vec4(0.0, 0.0, 0.0, 1.0);
         return;
